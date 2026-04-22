@@ -15,11 +15,6 @@ import json
 import sys
 from pathlib import Path
 
-_THIS = Path(__file__).resolve()
-sys.path.insert(0, str(_THIS.parent.parent))
-
-from common.harness_strip import strip_harness
-
 # Map CodeComplex labels (many surface forms) to our canonical labels.
 _CC_LABEL_MAP: dict[str, str] = {
     "o(1)": "O(1)", "1": "O(1)", "constant": "O(1)",
@@ -55,8 +50,6 @@ def main() -> int:
     ap.add_argument("--raw_path", default="data/raw/codecomplex/python.jsonl")
     ap.add_argument("--out", default="data/interim/parsed/codecomplex.jsonl")
     ap.add_argument("--limit", type=int, default=0)
-    ap.add_argument("--no_strip_harness", action="store_true",
-                    help="skip Codeforces I/O harness stripping (leave raw code)")
     args = ap.parse_args()
 
     in_path = Path(args.raw_path)
@@ -67,7 +60,7 @@ def main() -> int:
         out.write_text("", encoding="utf-8")
         return 0
 
-    n_total = n_emit = n_rej = n_stripped = 0
+    n_total = n_emit = n_rej = 0
     rej_reasons: dict[str, int] = {}
     with in_path.open("r", encoding="utf-8") as fin, out.open("w", encoding="utf-8") as fout:
         for line in fin:
@@ -108,13 +101,6 @@ def main() -> int:
                 rej_reasons[f"unmapped:{raw_comp}"] = rej_reasons.get(f"unmapped:{raw_comp}", 0) + 1
                 continue
             pid = "cc-" + hashlib.sha1(code.encode("utf-8")).hexdigest()[:12]
-
-            original_len = len(code)
-            if not args.no_strip_harness:
-                code = strip_harness(code)
-                if len(code) != original_len:
-                    n_stripped += 1
-
             fout.write(json.dumps({
                 "source": "codecomplex",
                 "problem_id": pid,
@@ -125,8 +111,7 @@ def main() -> int:
             }, ensure_ascii=False) + "\n")
             n_emit += 1
 
-    print(f"[03] total={n_total} emit={n_emit} reject={n_rej} "
-          f"harness_stripped={n_stripped}", flush=True)
+    print(f"[03] total={n_total} emit={n_emit} reject={n_rej}", flush=True)
     if rej_reasons:
         top = sorted(rej_reasons.items(), key=lambda kv: -kv[1])[:10]
         print(f"[03] top reject reasons: {top}", flush=True)

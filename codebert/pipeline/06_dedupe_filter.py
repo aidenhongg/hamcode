@@ -70,10 +70,7 @@ def main() -> int:
     ap.add_argument("--out", default="data/interim/filtered.jsonl")
     ap.add_argument("--max_tokens", type=int, default=512)
     ap.add_argument("--min_tokens", type=int, default=6)
-    # 0.92 keeps distinct-algorithm solutions that share boilerplate while still
-    # catching copy-paste duplicates. 0.85 was too aggressive — collapsed different
-    # LeetCode solutions that happened to share a 5-word shingle.
-    ap.add_argument("--threshold", type=float, default=0.92)
+    ap.add_argument("--threshold", type=float, default=0.85)
     ap.add_argument("--skip_tokenizer", action="store_true",
                     help="skip HF tokenizer; use char-length heuristic")
     args = ap.parse_args()

@@ -26,13 +26,8 @@ fi
 echo "[pipeline] fetch"
 python pipeline/01_fetch_sources.py
 
-echo "[pipeline] parse leetcode (reads Solution*.py files directly)"
+echo "[pipeline] parse leetcode"
 python pipeline/02_parse_leetcode.py --limit "$LIMIT"
-
-echo "[pipeline] parse codeforces (optional; needs HF network + datasets lib)"
-python pipeline/02b_parse_codeforces.py \
-  --submissions_limit "${CF_SUBMISSION_LIMIT:-200000}" \
-  --per_problem_cap 5 || echo "[pipeline] codeforces step skipped or failed — continuing"
 
 echo "[pipeline] parse codecomplex"
 python pipeline/03_parse_codecomplex.py --limit "$LIMIT"

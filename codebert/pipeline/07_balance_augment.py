@@ -77,8 +77,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--in_path", default="data/interim/filtered.jsonl")
     ap.add_argument("--out", default="data/interim/balanced.jsonl")
-    ap.add_argument("--cap_per_class", type=int, default=1500,
-                    help="upper bound per class after balancing")
+    ap.add_argument("--cap_per_class", type=int, default=620)
     ap.add_argument("--max_aug_ratio", type=float, default=4.0)
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
