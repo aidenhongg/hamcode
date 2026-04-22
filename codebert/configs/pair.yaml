@@ -11,7 +11,7 @@ grad_accum: 2
 lr: 1.0e-5
 warmup_ratio: 0.1
 weight_decay: 0.01
-epochs: 5
+epochs: 30              # generous upper bound; patience is the real stopper
 label_smoothing: 0.05
 bf16: true
 class_weights: none
@@ -20,7 +20,6 @@ class_weights: none
 eval_every_steps: 200
 patience: 3           # stop if val macro-F1 doesn't improve for this many evals in a row
 min_delta: 1.0e-4     # improvements smaller than this don't count
-epochs_max: 50        # hard safety cap; patience is the real stopper
 seed: 42
 
 # Logging

@@ -91,16 +91,15 @@ class Config:
     lr: float = 2e-5
     warmup_ratio: float = 0.1
     weight_decay: float = 0.01
-    epochs: int = 8
+    epochs: int = 50                 # generous upper bound; patience is the real stopper
     label_smoothing: float = 0.0
     bf16: bool = True
     class_weights: str = "auto"           # auto | none | PATH
     warm_start_from: str = ""
     seed: int = 42
     eval_every_steps: int = 200
-    patience: int = 3
+    patience: int = 3               # stop after this many consecutive evals with no delta-improvement
     min_delta: float = 1.0e-4       # val macro-F1 must improve by > this to reset patience
-    epochs_max: int = 50            # hard safety cap; patience is the real stopper
     wandb_project: str = "codebert-complexity"
     dry_run: bool = False
     resume_from: str = ""
@@ -251,8 +250,6 @@ def main() -> int:
     ap.add_argument("--patience", type=int, default=None)
     ap.add_argument("--min_delta", type=float, default=None,
                     help="val macro-F1 must improve by > this to reset patience")
-    ap.add_argument("--epochs_max", type=int, default=None,
-                    help="hard safety cap; early stop via --patience is the real stopper")
     ap.add_argument("--wandb_project", default=None)
     ap.add_argument("--dry_run", action="store_true", default=None)
     ap.add_argument("--resume_from", default=None)
@@ -420,15 +417,14 @@ def main() -> int:
     best_epoch = -1
     patience = 0
 
-    epoch_limit = min(cfg.epochs, cfg.epochs_max) if cfg.epochs_max else cfg.epochs
-    logger.info("starting training: up to %d epochs (safety cap %d), %d total steps, warmup=%d",
-                epoch_limit, cfg.epochs_max, total_steps, warmup)
+    logger.info("starting training: up to %d epochs max (patience-stopped earlier), "
+                "%d total steps, warmup=%d", cfg.epochs, total_steps, warmup)
     logger.info("early stop: patience=%d evals, min_delta=%.4f (val macro-F1)",
                 cfg.patience, cfg.min_delta)
 
     # --- train loop -----
     try:
-        for epoch in range(start_epoch, epoch_limit):
+        for epoch in range(start_epoch, cfg.epochs):
             model.train()
             optimizer.zero_grad(set_to_none=True)
             pbar = tqdm(
