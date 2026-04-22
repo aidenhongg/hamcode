@@ -33,6 +33,23 @@
 
 set -euo pipefail
 
+# ---------------------------------------------------------------------------
+# Kill transformers' background safetensors-conversion thread.
+# Root cause: transformers spawns Thread-auto_conversion that HEAD-requests
+# model.safetensors on every open PR ref (refs/pr/N). For
+# microsoft/graphcodebert-base, PR #8 is an orphan LFS safetensors conversion
+# whose redirects hang indefinitely. This blocks training on network I/O.
+#
+# - DISABLE_SAFETENSORS_CONVERSION=1 short-circuits the thread entirely
+#   (see transformers/modeling_utils.py:_get_resolved_checkpoint_files,
+#   can_auto_convert gate).
+# - HF_HUB_DOWNLOAD_TIMEOUT=30 bounds any residual HEAD/GET — default is 10s
+#   but LFS redirects have no upper bound without this.
+# These must be exported BEFORE any python process that imports transformers.
+# ---------------------------------------------------------------------------
+export DISABLE_SAFETENSORS_CONVERSION=1
+export HF_HUB_DOWNLOAD_TIMEOUT=30
+
 SKIP_DATA=0
 SKIP_POINT=0
 SKIP_PAIR=0
@@ -65,12 +82,47 @@ if python -c "import torchvision" 2>/dev/null; then
     pip uninstall -y torchvision torchaudio >/dev/null 2>&1 || true
 fi
 
-echo "=== [1/6] GPU check ==="
+echo "=== [0.5/6] GPU + transformers sanity (still ONLINE for pre-download) ==="
 python -c "import torch; assert torch.cuda.is_available(), 'no CUDA'; print('GPU:', torch.cuda.get_device_name(0), 'torch:', torch.__version__, 'bf16:', torch.cuda.is_bf16_supported())"
-# Fail fast if transformers can't import RobertaModel — this catches the
-# torch/torchvision ABI mismatch even when the import happened deep inside
-# subprocess-spawned train.py, where the traceback is harder to read.
-python -c "from transformers import AutoModel; AutoModel.from_pretrained('microsoft/graphcodebert-base'); print('transformers + encoder load OK')" 2>&1 | tail -5
+
+echo "=== [1/6] Pre-download microsoft/graphcodebert-base from main (no PR refs) ==="
+# snapshot_download walks repo_id@revision and fetches only the allow-listed
+# files. It never falls through to PR refs — that fallback is strictly a
+# transformers.from_pretrained behaviour, not huggingface_hub's. After this
+# step the HF cache has everything we need, and we can lock into offline
+# mode so no subsequent subprocess is ever tempted to call home.
+python -c "
+from huggingface_hub import snapshot_download
+p = snapshot_download(
+    'microsoft/graphcodebert-base',
+    revision='main',
+    allow_patterns=[
+        'config.json',
+        'pytorch_model.bin',
+        'tokenizer.json',
+        'tokenizer_config.json',
+        'vocab.json',
+        'merges.txt',
+        'special_tokens_map.json',
+        'added_tokens.json',
+    ],
+)
+print('cached at', p)
+"
+
+# Lock the rest of the pipeline into offline mode. Both names are honoured by
+# huggingface_hub.constants: HF_HUB_OFFLINE = _is_true(os.environ.get(
+# 'HF_HUB_OFFLINE') or os.environ.get('TRANSFORMERS_OFFLINE')).
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "=== [1.5/6] Offline-mode smoke: load encoder from cache only ==="
+python -c "
+from transformers import AutoModel, AutoTokenizer
+_t = AutoTokenizer.from_pretrained('microsoft/graphcodebert-base')
+_m = AutoModel.from_pretrained('microsoft/graphcodebert-base')
+print('encoder + tokenizer load OK from cache (offline)')
+"
 
 if [ "$SKIP_DATA" -eq 0 ]; then
     echo "=== [2/6] Building dataset ==="

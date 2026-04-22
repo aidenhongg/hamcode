@@ -60,6 +60,25 @@ pip install -r requirements-stacking.txt    # xgboost, lightgbm, radon, joblib
 `stacking/scripts/run_runpod.sh` runs this `uninstall` step defensively
 every time, so you can skip it here if you prefer one-shot execution.
 
+## Why the runpod script sets DISABLE_SAFETENSORS_CONVERSION=1
+
+`microsoft/graphcodebert-base`'s `main` branch only ships `pytorch_model.bin`.
+For every such repo, `transformers.modeling_utils._get_resolved_checkpoint_files`
+launches a **background thread** (`Thread-auto_conversion`) that walks every
+open PR ref (`refs/pr/N`) looking for a safetensors conversion. PR #8 of this
+model is exactly such a conversion, but its LFS redirects hang indefinitely —
+the thread runs alongside training, holds network sockets, and blocks the
+main process on I/O. `use_safetensors=False` does NOT gate that thread; it
+only affects the main-thread file-preference logic.
+
+The only real kill switches (from the `can_auto_convert` gate in transformers):
+`DISABLE_SAFETENSORS_CONVERSION=1`, or `TRANSFORMERS_OFFLINE=1` /
+`HF_HUB_OFFLINE=1`. `run_runpod.sh` exports the first flag at script start, then
+pre-downloads the model from `main` via `snapshot_download` (which is
+huggingface_hub, not transformers, so it never does the PR-ref dance), then
+exports the offline flags so every downstream subprocess reads from the cache
+and never calls home.
+
 ## One-shot pipeline
 
 ```bash
