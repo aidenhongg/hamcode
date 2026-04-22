@@ -86,12 +86,13 @@ python -m stacking.features.ast_features \
 
 if [ "$SKIP_POINT" -eq 0 ]; then
     echo "=== [4/6] OOF pointwise BERT (leakage fix) ==="
-    # Tuned for 5090 / 32GB VRAM. Warm-starts off fresh GraphCodeBERT-base per fold.
+    # Tuned for 5090 / 32GB VRAM. Warm-starts off fresh GraphCodeBERT-base per
+    # fold. Epochs is a generous upper bound — patience=3 is the real stopper.
     python -m stacking.features.oof_point \
         --data_dir data/processed \
         --out_dir "$EXTRACTION_DIR" \
         --n_folds "$N_FOLDS" \
-        --epochs 8 \
+        --epochs 50 \
         --batch_size 16 \
         --grad_accum 2 \
         --lr 2e-5 \
@@ -113,12 +114,13 @@ python -m stacking.features.semantic \
 
 if [ "$SKIP_PAIR" -eq 0 ]; then
     echo "=== [6/6a] OOF pairwise BERT (leakage fix) ==="
-    # Warm-starts from the OOF full pointwise encoder (matches legacy training recipe).
+    # Warm-starts from the OOF full pointwise encoder (matches legacy recipe).
+    # Epochs is a generous upper bound — patience=3 is the real stopper.
     python -m stacking.features.oof_pair \
         --data_dir data/processed \
         --out_dir "$EXTRACTION_DIR" \
         --n_folds "$N_FOLDS" \
-        --epochs 6 \
+        --epochs 30 \
         --batch_size 12 \
         --grad_accum 2 \
         --lr 1e-5 \

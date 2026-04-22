@@ -272,7 +272,11 @@ def main() -> int:
     ap.add_argument("--n_folds", type=int, default=5)
     ap.add_argument("--seed", type=int, default=42)
 
-    ap.add_argument("--epochs", type=int, default=6)
+    # Training hyperparams (passed to train.py). Defaults match configs/pair.yaml
+    # — epochs is a generous upper bound; patience is the real stopper.
+    ap.add_argument("--epochs", type=int, default=30,
+                    help="Hard upper bound. Patience (default 3) usually stops "
+                         "training at ~10-15 epochs per fold.")
     ap.add_argument("--batch_size", type=int, default=12)
     ap.add_argument("--grad_accum", type=int, default=2)
     ap.add_argument("--lr", type=float, default=1e-5)
@@ -283,7 +287,8 @@ def main() -> int:
     ap.add_argument("--num_workers", type=int, default=4)
     ap.add_argument("--max_seq_len", type=int, default=512)
     ap.add_argument("--eval_every_steps", type=int, default=200)
-    ap.add_argument("--patience", type=int, default=3)
+    ap.add_argument("--patience", type=int, default=3,
+                    help="Stop after this many consecutive evals with no improvement.")
     ap.add_argument("--warm_start_from", default="",
                     help="Pass path to an OOF pointwise final checkpoint (recommended). "
                          "Leave empty to train from fresh GraphCodeBERT-base.")

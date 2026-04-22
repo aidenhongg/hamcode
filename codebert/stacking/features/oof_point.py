@@ -295,8 +295,11 @@ def main() -> int:
     ap.add_argument("--n_folds", type=int, default=5)
     ap.add_argument("--seed", type=int, default=42)
 
-    # Training hyperparams (passed to train.py)
-    ap.add_argument("--epochs", type=int, default=8)
+    # Training hyperparams (passed to train.py). Defaults match configs/point.yaml
+    # — epochs is a generous upper bound; patience is the real stopper.
+    ap.add_argument("--epochs", type=int, default=50,
+                    help="Hard upper bound. Patience (default 3) usually stops "
+                         "training at ~15-20 epochs on the full train set.")
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--grad_accum", type=int, default=2)
     ap.add_argument("--lr", type=float, default=2e-5)
@@ -305,7 +308,8 @@ def main() -> int:
     ap.add_argument("--num_workers", type=int, default=4)
     ap.add_argument("--max_seq_len", type=int, default=512)
     ap.add_argument("--eval_every_steps", type=int, default=200)
-    ap.add_argument("--patience", type=int, default=3)
+    ap.add_argument("--patience", type=int, default=3,
+                    help="Stop after this many consecutive evals with no improvement.")
 
     # Extraction hyperparams
     ap.add_argument("--extract_batch", type=int, default=32,
