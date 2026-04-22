@@ -23,9 +23,12 @@ from pathlib import Path
 LEETCODE_REPO = "https://github.com/doocs/leetcode.git"
 
 # Order matters — first success wins. Extend as more mirrors appear.
+# Primary: sybaik1/CodeComplex-Data has separate python_data.jsonl (Python-only).
+# Fallback: codeparrot/codecomplex on HF Hub has Java+Python mixed in data.jsonl —
+#   03_parse_codecomplex.py filters by the `language` or `from` field.
 CODECOMPLEX_CANDIDATES: tuple[str, ...] = (
-    "https://raw.githubusercontent.com/yonsei-toc/CodeComplex/main/dataset/python.jsonl",
-    "https://huggingface.co/datasets/code-complex/codecomplex/resolve/main/python.jsonl",
+    "https://raw.githubusercontent.com/sybaik1/CodeComplex-Data/main/python_data.jsonl",
+    "https://huggingface.co/datasets/codeparrot/codecomplex/resolve/main/data.jsonl",
 )
 
 

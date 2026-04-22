@@ -66,17 +66,32 @@ def write_rejects(rejects: list[dict], path: Path) -> int:
 
 
 # Patterns for mining complexity comments from source code. Matched against the
-# first ~2KB of a file (header area). Captures the inner O(...) expression.
-# We accept: "Time complexity:", "Time:", "T(n):", "Time Complexity :", etc.
-_COMPLEXITY_RE = re.compile(
-    r"""
-    (?:time\s*(?:complexity)?\s*[:\-=])   # 'Time:' / 'Time complexity:' / 'Time -'
+# first ~2KB of a file (header area). Two families:
+#   1. Prefix form: "Time complexity: O(...)" / "Time: O(...)" / "T(n) = O(...)"
+#   2. Suffix form: "O(...) time" / "O(...) time complexity"
+# Nested-paren variant is listed FIRST in the alternation so `O((m+n) log(m+n))`
+# wins over the simpler one-paren form.
+_O_EXPR = r"""
+    O\s*\(                                   # O(
+      (?:[^()\n]|\([^()\n]*\)){1,160}        # body allowing one level of nested parens
+    \)
+    |
+    O\s*\([^)\n]{1,160}\)                    # flat O(...)
+"""
+
+_PREFIX_COMPLEXITY_RE = re.compile(
+    rf"""
+    (?:time\s*(?:complexity)?\s*[:\-=])      # 'Time:' / 'Time complexity:' / 'Time -'
     \s*
-    (?P<expr>
-        O\s*\([^)\n]{1,120}\)             # O(...) without nested parens on one line
-        |
-        O\s*\((?:[^()\n]|\([^()\n]*\)){1,120}\)   # allow one level of nested parens
-    )
+    (?P<expr>{_O_EXPR})
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+_SUFFIX_COMPLEXITY_RE = re.compile(
+    rf"""
+    (?P<expr>{_O_EXPR})
+    \s+time\b                                # "O(...) time"
     """,
     re.IGNORECASE | re.VERBOSE,
 )
@@ -85,10 +100,14 @@ _COMPLEXITY_RE = re.compile(
 def find_complexity_in_text(text: str, max_chars: int = 2048) -> str | None:
     """Search for the first complexity annotation in the first `max_chars` of text.
 
-    Returns the raw O(...) string or None.
+    Tries the prefix form first ("Time complexity: O(...)"), then the suffix
+    form ("O(...) time"). Returns the raw O(...) string or None.
     """
     head = text[:max_chars]
-    m = _COMPLEXITY_RE.search(head)
+    m = _PREFIX_COMPLEXITY_RE.search(head)
+    if m:
+        return m.group("expr").strip()
+    m = _SUFFIX_COMPLEXITY_RE.search(head)
     if m:
         return m.group("expr").strip()
     return None

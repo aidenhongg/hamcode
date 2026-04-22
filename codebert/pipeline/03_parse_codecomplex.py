@@ -80,6 +80,21 @@ def main() -> int:
             if not code or not raw_comp:
                 n_rej += 1; rej_reasons["missing_fields"] = rej_reasons.get("missing_fields", 0) + 1
                 continue
+            # If this is the HF mixed Java+Python file, skip non-Python rows.
+            # Heuristic: `language` field if present; else detect by syntax.
+            lang = (obj.get("language") or obj.get("from") or "").lower()
+            if lang and lang not in ("python", "py", "python3"):
+                # Some HF variants use `from` to mean source-of-problem (e.g. Codeforces);
+                # fall through in that case using a syntax heuristic.
+                if lang in ("java", "c", "cpp", "c++", "js", "javascript"):
+                    n_rej += 1
+                    rej_reasons[f"non_python:{lang}"] = rej_reasons.get(f"non_python:{lang}", 0) + 1
+                    continue
+            # Syntax heuristic: Java has `public class` / `;` / `{` structure absent from Python.
+            if "public class " in code and "def " not in code:
+                n_rej += 1
+                rej_reasons["non_python_syntax"] = rej_reasons.get("non_python_syntax", 0) + 1
+                continue
             label = map_cc_label(str(raw_comp))
             if not label:
                 n_rej += 1
