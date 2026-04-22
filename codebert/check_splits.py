@@ -6,9 +6,13 @@ from __future__ import annotations
 
 import hashlib
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 import pyarrow.parquet as pq
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from common.labels import POINT_LABELS
 
 
 def _load(path: Path) -> list[dict]:
@@ -106,6 +110,48 @@ def main() -> int:
     print("\n--- source distribution per split ---")
     for name, rows in (("train", train), ("val", val), ("test", test)):
         print(f"  {name}: {_source_dist(rows)}")
+
+    # Per-class breakdown: records AND unique problems per split.
+    def _class_breakdown(rows: list[dict]) -> tuple[dict[str, int], dict[str, int]]:
+        recs: dict[str, int] = defaultdict(int)
+        pids: dict[str, set[str]] = defaultdict(set)
+        for r in rows:
+            lab = r["label"]
+            recs[lab] += 1
+            pid = r.get("problem_id")
+            if pid:
+                pids[lab].add(pid)
+        return dict(recs), {k: len(v) for k, v in pids.items()}
+
+    train_rec, train_pid = _class_breakdown(train)
+    val_rec, val_pid = _class_breakdown(val)
+    test_rec, test_pid = _class_breakdown(test)
+
+    print("\n--- records / unique problems per class per split ---")
+    print(f"  {'class':<22} {'train':>16}   {'val':>14}   {'test':>14}")
+    print(f"  {'':<22} {'recs / probs':>16}   {'recs / probs':>14}   {'recs / probs':>14}")
+    print(f"  {'-'*22} {'-'*16}   {'-'*14}   {'-'*14}")
+    for lab in POINT_LABELS:
+        tr = train_rec.get(lab, 0); trp = train_pid.get(lab, 0)
+        vr = val_rec.get(lab, 0);   vrp = val_pid.get(lab, 0)
+        te = test_rec.get(lab, 0);  tep = test_pid.get(lab, 0)
+        thin = " [THIN]" if tr < 100 else ""
+        print(f"  {lab:<22} {tr:>7} / {trp:<6}   {vr:>5} / {vrp:<5}   "
+              f"{te:>5} / {tep:<5}{thin}")
+
+    # Flag classes where train has very few unique problems — model may overfit to them.
+    narrow = []
+    for lab in POINT_LABELS:
+        probs = train_pid.get(lab, 0)
+        recs = train_rec.get(lab, 0)
+        # narrow = many records but few unique problems (e.g., heavy augmentation over 1-2 templates)
+        if recs >= 50 and probs > 0 and recs / probs >= 5:
+            narrow.append((lab, recs, probs, recs / probs))
+    if narrow:
+        print("\n  [WARN] train classes dominated by few unique problems "
+              "(records/problem ratio >= 5):")
+        for lab, r, p, ratio in narrow:
+            print(f"    {lab:<22} {r} records across {p} problems  (ratio={ratio:.1f})")
 
     # Pairwise audit
     pair_train = _load(root / "pair_train.parquet")
