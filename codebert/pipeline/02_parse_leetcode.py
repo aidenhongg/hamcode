@@ -26,14 +26,27 @@ from markdown_it import MarkdownIt
 # Fence detection
 SOLUTION_FENCE = re.compile(r"<!--\s*solution:(start|end)\s*-->", re.IGNORECASE)
 
-# Primary: "time complexity is $O(...)$"
+# Primary: permissive — accepts "is", ":", "-", or nothing, plus optional bold/italic
+# around "time complexity", handling common LeetCode README formats:
+#   "The time complexity is $O(n)$"
+#   "Time Complexity: $O(n)$"
+#   "**Time complexity:** $O(n)$"
+#   "- Time complexity: $O(n)$"
+#   "time complexity - $O(n)$"
 COMPLEXITY_RE = re.compile(
-    r"time\s+complexity\s+is\s+\$?O\(([^$)]+)\)\$?",
+    r"(?:[*_\s>\-]*)?time\s+complexity[*_\s]*"
+    r"(?:\s+is|\s*[:：\-—–])?\s*"
+    r"\$?\s*O\s*\(([^$)]+)\)\s*\$?",
     re.IGNORECASE,
 )
-# Fallback: any "$O(...)$" preceded by "time" within ~80 chars, same paragraph-ish.
+# Fallback 1: any "$O(...)$" preceded by "time" within ~120 chars same paragraph.
 COMPLEXITY_RE_LOOSE = re.compile(
-    r"time[^.\n]{0,80}?\$O\(([^$)]+)\)\$",
+    r"time[^.\n]{0,120}?\$?\s*O\s*\(([^$)]+)\)\s*\$?",
+    re.IGNORECASE,
+)
+# Fallback 2: bullet-style with inline code: "- 时间复杂度: $O(n)$" or "Time: $O(n)$"
+COMPLEXITY_RE_BULLET = re.compile(
+    r"(?:time|时间复杂度)[*_:\s]*\$?\s*O\s*\(([^$)]+)\)\s*\$?",
     re.IGNORECASE,
 )
 
@@ -56,16 +69,24 @@ def split_solution_blocks(md: str) -> list[tuple[int, str]]:
     return blocks if blocks else [(0, md)]
 
 
+def extract_all_python_code_blocks(block: str, mdit: MarkdownIt) -> list[str]:
+    """Return EVERY python code fence in order (some solutions show two variants)."""
+    out: list[str] = []
+    tokens = mdit.parse(block)
+    for tok in tokens:
+        if tok.type == "fence" and tok.info.strip().lower() in ("python", "python3", "py"):
+            out.append(tok.content)
+    return out
+
+
 def extract_python_and_complexity(
     block: str, mdit: MarkdownIt
 ) -> tuple[str | None, str | None]:
-    tokens = mdit.parse(block)
-    py_code: str | None = None
-    for tok in tokens:
-        if tok.type == "fence" and tok.info.strip().lower() in ("python", "python3"):
-            py_code = tok.content
-            break
-    m = COMPLEXITY_RE.search(block) or COMPLEXITY_RE_LOOSE.search(block)
+    codes = extract_all_python_code_blocks(block, mdit)
+    py_code = codes[0] if codes else None
+    m = (COMPLEXITY_RE.search(block)
+         or COMPLEXITY_RE_LOOSE.search(block)
+         or COMPLEXITY_RE_BULLET.search(block))
     complexity = m.group(1).strip() if m else None
     return py_code, complexity
 
@@ -118,23 +139,30 @@ def main() -> int:
             problem_id = derive_problem_id(path)
             for idx, block in split_solution_blocks(text):
                 n_blocks += 1
-                py, comp = extract_python_and_complexity(block, mdit)
-                if not py or not comp:
+                # Find complexity once per block; emit one record per Python snippet
+                # in that block (some blocks have multiple py implementations).
+                codes = extract_all_python_code_blocks(block, mdit)
+                m = (COMPLEXITY_RE.search(block)
+                     or COMPLEXITY_RE_LOOSE.search(block)
+                     or COMPLEXITY_RE_BULLET.search(block))
+                comp = m.group(1).strip() if m else None
+                if not codes or not comp:
                     ffail.write(json.dumps({
                         "path": str(path), "solution_idx": idx,
-                        "has_python": bool(py), "has_complexity": bool(comp),
+                        "has_python": bool(codes), "has_complexity": bool(comp),
                     }) + "\n")
                     n_failed += 1
                     continue
-                fout.write(json.dumps({
-                    "source": "leetcode",
-                    "problem_id": problem_id,
-                    "solution_idx": idx,
-                    "code": py,
-                    "raw_complexity": comp,
-                    "path": str(path),
-                }, ensure_ascii=False) + "\n")
-                n_records += 1
+                for sub_i, py in enumerate(codes):
+                    fout.write(json.dumps({
+                        "source": "leetcode",
+                        "problem_id": problem_id,
+                        "solution_idx": idx * 10 + sub_i,   # unique across sub-snippets
+                        "code": py,
+                        "raw_complexity": comp,
+                        "path": str(path),
+                    }, ensure_ascii=False) + "\n")
+                    n_records += 1
 
     rate = 100 * n_records / n_blocks if n_blocks else 0
     print(f"[02] files={n_files} blocks={n_blocks} records={n_records} "

@@ -28,6 +28,13 @@ def pre_canonicalize(s: str) -> str:
     s = re.sub(r"\\ln\b", "log", s)
     s = re.sub(r"\\sqrt\b", "sqrt", s)
     s = re.sub(r"\\alpha\b", "alpha", s)
+    s = re.sub(r"\\max\b", "max", s)
+    s = re.sub(r"\\min\b", "min", s)
+    # \textit{name} / \mathit{name} / \mathrm{name} — unwrap to just `name`
+    s = re.sub(r"\\(?:textit|mathit|mathrm|text)\{([^}]+)\}", r"\1", s)
+    # |\Sigma| and variants -> a constant marker. Upper or lower, with spaces.
+    s = re.sub(r"\|\s*\\?sigma\s*\|", "c", s, flags=re.IGNORECASE)
+    s = re.sub(r"\|[a-z]\|", "c", s, flags=re.IGNORECASE)  # |x|, |S|, etc. -> const
     s = re.sub(r"\{|\}", "", s)
     s = re.sub(r"\bln\b", "log", s)
     s = s.replace("·", "*").replace("×", "*").replace("⋅", "*")
@@ -44,11 +51,20 @@ def extract_inner(s: str) -> str:
 
 
 def _word_var_replace(expr: str) -> str:
+    # Matrix dims (common in LeetCode problem editorials)
     expr = re.sub(r"\brows?\b", "m", expr)
     expr = re.sub(r"\bcols?\b|\bcolumns?\b", "n", expr)
     expr = re.sub(r"\bheight\b", "m", expr)
     expr = re.sub(r"\bwidth\b", "n", expr)
     expr = re.sub(r"\blen\b", "n", expr)
+    # LeetCode-common multi-letter input names
+    expr = re.sub(r"\bnums?\b", "n", expr)
+    expr = re.sub(r"\btarget\b", "n", expr)
+    expr = re.sub(r"\bval(?:ue)?\b", "n", expr)
+    expr = re.sub(r"\bsize\b", "n", expr)
+    # Named constants (bounded alphabets / limits) -> single 'c' so pattern matching
+    # can use bounded-constant patterns below.
+    expr = re.sub(r"\bsigma\b", "c", expr)
     return expr
 
 
@@ -72,18 +88,48 @@ def normalize_variables(expr: str) -> str:
 
 
 _PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    # === inverse Ackermann (treated as constant) ===
     (re.compile(r"^alpha\s*\(\s*n\s*\)$"), "O(1)"),
-    (re.compile(r"^alpha\s*\*\s*n$"), "O(1)"),
+    (re.compile(r"^alpha\s*\*\s*n$"), "O(n)"),
+    (re.compile(r"^n\s*\*\s*alpha\s*\(\s*n\s*\)$"), "O(n)"),
+
+    # === sum-of-logs (m log m + n log n) ≈ (m+n) log(m+n) ===
+    (re.compile(r"^m\s*\*?\s*log\s*\(?\s*m\s*\)?\s*\+\s*n\s*\*?\s*log\s*\(?\s*n\s*\)?$"),
+     "O((m+n) log(m+n))"),
+    (re.compile(r"^n\s*\*?\s*log\s*\(?\s*n\s*\)?\s*\+\s*m\s*\*?\s*log\s*\(?\s*m\s*\)?$"),
+     "O((m+n) log(m+n))"),
+
+    # === explicit (m+n) log(m+n) ===
     (re.compile(r"^\(\s*m\s*\+\s*n\s*\)\s*\*?\s*log\s*\(\s*m\s*\+\s*n\s*\)$"), "O((m+n) log(m+n))"),
     (re.compile(r"^\(\s*n\s*\+\s*m\s*\)\s*\*?\s*log\s*\(\s*n\s*\+\s*m\s*\)$"), "O((m+n) log(m+n))"),
+
+    # === O(m log n) ===
     (re.compile(r"^m\s*\*?\s*log\s*\(?\s*n\s*\)?$"), "O(m log n)"),
     (re.compile(r"^n\s*\*?\s*log\s*\(?\s*m\s*\)?$"), "O(m log n)"),
     (re.compile(r"^log\s*\(?\s*m\s*\)?\s*\*?\s*n$"), "O(m log n)"),
     (re.compile(r"^log\s*\(?\s*n\s*\)?\s*\*?\s*m$"), "O(m log n)"),
+
+    # === max/min(m, n) ≈ m+n tier ===
+    (re.compile(r"^max\s*\(\s*m\s*,\s*n\s*\)$"), "O(m+n)"),
+    (re.compile(r"^max\s*\(\s*n\s*,\s*m\s*\)$"), "O(m+n)"),
+    (re.compile(r"^min\s*\(\s*m\s*,\s*n\s*\)$"), "O(m+n)"),
+    (re.compile(r"^min\s*\(\s*n\s*,\s*m\s*\)$"), "O(m+n)"),
+
+    # === O(m*n) ===
     (re.compile(r"^m\s*\*\s*n$"), "O(m*n)"),
     (re.compile(r"^n\s*\*\s*m$"), "O(m*n)"),
+
+    # === O(m+n) ===
     (re.compile(r"^m\s*\+\s*n$"), "O(m+n)"),
     (re.compile(r"^n\s*\+\s*m$"), "O(m+n)"),
+
+    # === exponential × polynomial in n — still exponential ===
+    (re.compile(r"^n\s*\*\s*2\s*\*\*\s*n$"), "exponential"),
+    (re.compile(r"^2\s*\*\*\s*n\s*\*\s*n$"), "exponential"),
+    (re.compile(r"^n\s*\*\*\s*\d+\s*\*\s*2\s*\*\*\s*n$"), "exponential"),
+    (re.compile(r"^2\s*\*\*\s*n\s*\*\s*n\s*\*\*\s*\d+$"), "exponential"),
+
+    # === exponential / factorial ===
     (re.compile(r"^2\s*\*\*\s*n$"), "exponential"),
     (re.compile(r"^\d+\s*\*\*\s*n$"), "exponential"),
     (re.compile(r"^c\s*\*\*\s*n$"), "exponential"),
@@ -91,22 +137,43 @@ _PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^n\s*!$"), "exponential"),
     (re.compile(r"^n\s*\*\s*n\s*!$"), "exponential"),
     (re.compile(r"^\(\s*n\s*-\s*\d+\s*\)\s*!$"), "exponential"),
+
+    # === O(n^3) ===
     (re.compile(r"^n\s*\*\*\s*3$"), "O(n^3)"),
     (re.compile(r"^n\s*\*\s*n\s*\*\s*n$"), "O(n^3)"),
+
+    # === O(n^2) ===
     (re.compile(r"^n\s*\*\*\s*2$"), "O(n^2)"),
     (re.compile(r"^n\s*\*\s*n$"), "O(n^2)"),
+
+    # === O(n log n) ===
     (re.compile(r"^n\s*\*\s*log\s*\(?\s*n\s*\)?$"), "O(n log n)"),
     (re.compile(r"^n\s*log\s*\(?\s*n\s*\)?$"), "O(n log n)"),
     (re.compile(r"^log\s*\(?\s*n\s*\)?\s*\*\s*n$"), "O(n log n)"),
     (re.compile(r"^log\s*\(\s*n\s*!\s*\)$"), "O(n log n)"),
+
+    # === O(log n) ===
     (re.compile(r"^log\s*\(?\s*n\s*\)?$"), "O(log n)"),
+
+    # === O(n) ===
     (re.compile(r"^n$"), "O(n)"),
     (re.compile(r"^n\s*\+\s*\d+$"), "O(n)"),
     (re.compile(r"^\d+\s*\*\s*n$"), "O(n)"),
     (re.compile(r"^n\s*\+\s*k$"), "O(n)"),
     (re.compile(r"^k\s*\*\s*n$"), "O(n)"),
     (re.compile(r"^n\s*\*\s*k$"), "O(n)"),
+    (re.compile(r"^n\s*\+\s*c$"), "O(n)"),       # O(n + |Σ|) after Σ→c
+    (re.compile(r"^c\s*\+\s*n$"), "O(n)"),
+    (re.compile(r"^n\s*\*\s*c$"), "O(n)"),       # O(n × |Σ|)
+    (re.compile(r"^c\s*\*\s*n$"), "O(n)"),
+    (re.compile(r"^n\s*\*\s*\d+$"), "O(n)"),
+
+    # === O(1) ===
     (re.compile(r"^\d+$"), "O(1)"),
+    (re.compile(r"^k$"), "O(1)"),              # bare constant
+    (re.compile(r"^c$"), "O(1)"),              # bare constant
+    (re.compile(r"^k\s*\*\s*c$"), "O(1)"),
+    (re.compile(r"^c\s*\*\s*k$"), "O(1)"),
 ]
 
 

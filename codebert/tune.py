@@ -83,11 +83,23 @@ def main() -> int:
     mode.add_argument("--point", dest="task", action="store_const", const="point")
     mode.add_argument("--pair", dest="task", action="store_const", const="pair")
     ap.add_argument("--n_trials", type=int, default=12)
-    ap.add_argument("--max_epochs", type=int, default=6)
+    ap.add_argument("--max_epochs", type=int, default=6,
+                    help="per-trial epoch cap during search (keep small for speed)")
     ap.add_argument("--study", default="tune")
     ap.add_argument("--data_dir", default="data/processed")
     ap.add_argument("--base_output_dir", default="runs/tune")
     ap.add_argument("--test_metrics_field", default="macro_f1")
+    # Final run with best HPs (default ON — this is the "single-command" workflow)
+    ap.add_argument("--no_final", action="store_true",
+                    help="skip the final full training run with best HPs")
+    ap.add_argument("--final_epochs", type=int, default=50,
+                    help="epochs for the final extended run (patience stops earlier)")
+    ap.add_argument("--final_patience", type=int, default=5,
+                    help="patience for the final run")
+    ap.add_argument("--final_output_dir", default="",
+                    help="where to put the final run (default: <base_output_dir>/final)")
+    ap.add_argument("--warm_start_from", default="",
+                    help="pass-through to train.py for --pair warm-start")
     args = ap.parse_args()
 
     base = Path(args.base_output_dir); base.mkdir(parents=True, exist_ok=True)
@@ -117,6 +129,41 @@ def main() -> int:
         }, indent=2),
         encoding="utf-8",
     )
+
+    # --- Final extended training with best HPs ---
+    if args.no_final:
+        print("[tune] --no_final set; skipping final training run.")
+        return 0
+
+    final_out = Path(args.final_output_dir or (base / "final"))
+    best_hp = dict(best.params)
+    best_hp["epochs"] = args.final_epochs     # override search cap with a proper training run
+    final_cmd = build_cmd(args.task, args.data_dir, str(final_out), best_hp) + [
+        "--patience", str(args.final_patience),
+    ]
+    if args.task == "pair" and args.warm_start_from:
+        final_cmd += ["--warm_start_from", args.warm_start_from]
+
+    print("\n=== FINAL RUN (best HPs, extended epochs) ===")
+    print("cmd:", " ".join(final_cmd), flush=True)
+    proc = subprocess.run(final_cmd)
+    if proc.returncode != 0:
+        print(f"[tune] final run failed (returncode={proc.returncode})")
+        return proc.returncode
+
+    met_path = final_out / "test_metrics.json"
+    if met_path.exists():
+        met = json.loads(met_path.read_text(encoding="utf-8"))
+        print("\n=== FINAL TEST METRICS ===")
+        print(f"  macro_f1 = {met.get('macro_f1')}")
+        print(f"  accuracy = {met.get('accuracy')}")
+        within = met.get("within_1_tier_accuracy")
+        if within is not None:
+            print(f"  within_1_tier_accuracy = {within}")
+        print(f"\nArtifacts written to: {final_out}")
+        print(f"  best checkpoint:  {final_out}/best/")
+        print(f"  plots:            {final_out}/*.png")
+        print(f"  full test json:   {met_path}")
     return 0
 
 
