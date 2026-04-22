@@ -18,7 +18,9 @@ class_weights: auto   # auto | none | PATH to json of floats (11 values)
 
 # Eval / checkpointing
 eval_every_steps: 200
-patience: 3
+patience: 3           # stop if val macro-F1 doesn't improve for this many evals in a row
+min_delta: 1.0e-4     # improvements smaller than this don't count
+epochs_max: 50        # hard safety cap; patience is the real stopper
 seed: 42
 
 # Logging

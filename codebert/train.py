@@ -99,6 +99,8 @@ class Config:
     seed: int = 42
     eval_every_steps: int = 200
     patience: int = 3
+    min_delta: float = 1.0e-4       # val macro-F1 must improve by > this to reset patience
+    epochs_max: int = 50            # hard safety cap; patience is the real stopper
     wandb_project: str = "codebert-complexity"
     dry_run: bool = False
     resume_from: str = ""
@@ -246,6 +248,10 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--eval_every_steps", type=int, default=None)
     ap.add_argument("--patience", type=int, default=None)
+    ap.add_argument("--min_delta", type=float, default=None,
+                    help="val macro-F1 must improve by > this to reset patience")
+    ap.add_argument("--epochs_max", type=int, default=None,
+                    help="hard safety cap; early stop via --patience is the real stopper")
     ap.add_argument("--wandb_project", default=None)
     ap.add_argument("--dry_run", action="store_true", default=None)
     ap.add_argument("--resume_from", default=None)
@@ -385,13 +391,15 @@ def main() -> int:
     best_epoch = -1
     patience = 0
 
-    logger.info("starting training: %d epochs, %d total steps, warmup=%d",
-                cfg.epochs, total_steps, warmup)
-    logger.info("(first epoch's early steps are slow while tree-sitter builds the DFG cache)")
+    epoch_limit = min(cfg.epochs, cfg.epochs_max) if cfg.epochs_max else cfg.epochs
+    logger.info("starting training: up to %d epochs (safety cap %d), %d total steps, warmup=%d",
+                epoch_limit, cfg.epochs_max, total_steps, warmup)
+    logger.info("early stop: patience=%d evals, min_delta=%.4f (val macro-F1)",
+                cfg.patience, cfg.min_delta)
 
     # --- train loop -----
     try:
-        for epoch in range(start_epoch, cfg.epochs):
+        for epoch in range(start_epoch, epoch_limit):
             model.train()
             optimizer.zero_grad(set_to_none=True)
             pbar = tqdm(
@@ -445,13 +453,18 @@ def main() -> int:
                             wandb_run.log({"val/" + k: v for k, v in _log_safe(met).items()
                                            if isinstance(v, (int, float))}, step=step)
                         f1 = met["macro_f1"]
-                        logger.info("eval step=%d macro_f1=%.4f acc=%.4f", step, f1, met["accuracy"])
-                        if f1 > best_f1:
+                        delta = f1 - best_f1
+                        logger.info("eval step=%d macro_f1=%.4f (Δ=%+.4f vs best) acc=%.4f",
+                                    step, f1, delta, met["accuracy"])
+                        if delta > cfg.min_delta:
                             best_f1 = f1; best_epoch = epoch; patience = 0
                             save_state(model, optimizer, scheduler, scaler, step, epoch, out_root / "best")
                             logger.info("saved best @ macro_f1=%.4f", f1)
                         else:
                             patience += 1
+                            logger.info("no improvement (Δ=%+.4f ≤ min_delta=%.4f), "
+                                        "patience=%d/%d",
+                                        delta, cfg.min_delta, patience, cfg.patience)
                             if patience >= cfg.patience:
                                 logger.info("early stop at step=%d (best macro_f1=%.4f @ epoch %d)",
                                             step, best_f1, best_epoch)
