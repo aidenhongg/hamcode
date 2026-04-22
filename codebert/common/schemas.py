@@ -1,0 +1,82 @@
+"""Dataset record schemas — dataclasses plus matching pyarrow schemas for parquet IO."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Optional
+
+import pyarrow as pa
+
+
+@dataclass
+class PointRecord:
+    id: str
+    source: str                  # leetcode | codecomplex | codenet | synthetic
+    problem_id: Optional[str]
+    solution_idx: Optional[int]
+    code: str
+    code_sha256: str
+    label: str                   # one of POINT_LABELS
+    raw_complexity: str
+    tokens_graphcodebert: int
+    ast_nodes: int
+    augmented_from: Optional[str] = None
+    split: str = "train"         # train | val | test
+
+    def to_dict(self) -> dict:
+        return self.__dict__.copy()
+
+
+@dataclass
+class PairRecord:
+    pair_id: str
+    code_a: str
+    code_b: str
+    label_a: str
+    label_b: str
+    ternary: str                 # A_faster | same | B_faster
+    same_problem: bool
+    tokens_combined: int
+    split: str = "train"
+
+    def to_dict(self) -> dict:
+        return self.__dict__.copy()
+
+
+POINT_SCHEMA = pa.schema([
+    ("id", pa.string()),
+    ("source", pa.string()),
+    ("problem_id", pa.string()),
+    ("solution_idx", pa.int32()),
+    ("code", pa.string()),
+    ("code_sha256", pa.string()),
+    ("label", pa.string()),
+    ("raw_complexity", pa.string()),
+    ("tokens_graphcodebert", pa.int32()),
+    ("ast_nodes", pa.int32()),
+    ("augmented_from", pa.string()),
+    ("split", pa.string()),
+])
+
+PAIR_SCHEMA = pa.schema([
+    ("pair_id", pa.string()),
+    ("code_a", pa.string()),
+    ("code_b", pa.string()),
+    ("label_a", pa.string()),
+    ("label_b", pa.string()),
+    ("ternary", pa.string()),
+    ("same_problem", pa.bool_()),
+    ("tokens_combined", pa.int32()),
+    ("split", pa.string()),
+])
+
+
+# Raw intermediate record produced by the pipeline/02-04 parsers before normalization.
+@dataclass
+class RawRecord:
+    source: str
+    problem_id: Optional[str]
+    solution_idx: Optional[int]
+    code: str
+    raw_complexity: str
+    extras: dict = field(default_factory=dict)

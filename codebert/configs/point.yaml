@@ -1,0 +1,25 @@
+task: point
+model_name: microsoft/graphcodebert-base
+
+# Sequence / DFG
+max_seq_len: 512
+max_dfg_nodes: 64
+
+# Optimization
+batch_size: 16
+grad_accum: 2
+lr: 2.0e-5
+warmup_ratio: 0.1
+weight_decay: 0.01
+epochs: 8
+label_smoothing: 0.0
+bf16: true
+class_weights: auto   # auto | none | PATH to json of floats (11 values)
+
+# Eval / checkpointing
+eval_every_steps: 200
+patience: 3
+seed: 42
+
+# Logging
+wandb_project: codebert-complexity
