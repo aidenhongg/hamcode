@@ -407,7 +407,11 @@ def _keep_valid_dfg(dfg: list[tuple], n_src_tokens: int) -> list[tuple]:
 # -----------------------------------------------------------------------------
 
 class PointDataset(Dataset):
-    """Loads a pointwise parquet, materializes InputBundle lazily with caching."""
+    """Loads a pointwise parquet. Defaults to simple 1D tokenization (no DFG).
+
+    Pass `use_dfg=True` to enable the tree-sitter + 2D-mask path. Simple mode
+    is ~10x faster per sample and needs no prewarming.
+    """
 
     def __init__(
         self,
@@ -416,13 +420,15 @@ class PointDataset(Dataset):
         max_seq_len: int = 512,
         max_dfg_nodes: int = 64,
         cache_dir: str | None = None,
+        use_dfg: bool = False,
     ) -> None:
         super().__init__()
         self.table = pq.read_table(parquet_path)
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
         self.max_dfg_nodes = max_dfg_nodes
-        self.cache = DFGCache(cache_dir) if cache_dir is not None else DFGCache()
+        self.use_dfg = use_dfg
+        self.cache = (DFGCache(cache_dir) if cache_dir is not None else DFGCache()) if use_dfg else None
         self._codes = self.table.column("code").to_pylist()
         self._labels = self.table.column("label").to_pylist()
         self._ids = self.table.column("id").to_pylist()
@@ -432,6 +438,23 @@ class PointDataset(Dataset):
 
     def __getitem__(self, i: int) -> dict[str, torch.Tensor]:
         code = self._codes[i]
+        label_idx = LABEL_TO_IDX[self._labels[i]]
+
+        if not self.use_dfg:
+            enc = self.tokenizer(
+                code,
+                truncation=True,
+                padding="max_length",
+                max_length=self.max_seq_len,
+                return_tensors="pt",
+            )
+            return {
+                "input_ids": enc["input_ids"][0],
+                "attention_mask": enc["attention_mask"][0],            # 1D — standard
+                "position_ids": torch.arange(self.max_seq_len, dtype=torch.long),
+                "labels": torch.tensor(label_idx, dtype=torch.long),
+            }
+
         key = f"point:{self.max_seq_len}:{self.max_dfg_nodes}"
         cached = self.cache.get(code + "|" + key)
         if cached is not None:
@@ -442,7 +465,6 @@ class PointDataset(Dataset):
                 self.cache.put(code + "|" + key, b)
             except OSError:
                 pass
-        label_idx = LABEL_TO_IDX[self._labels[i]]
         return {
             "input_ids": torch.from_numpy(b.input_ids),
             "position_ids": torch.from_numpy(b.position_ids),
@@ -461,13 +483,15 @@ class PairDataset(Dataset):
         max_seq_len: int = 512,
         max_dfg_nodes: int = 64,
         cache_dir: str | None = None,
+        use_dfg: bool = False,
     ) -> None:
         super().__init__()
         self.table = pq.read_table(parquet_path)
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
         self.max_dfg_nodes = max_dfg_nodes
-        self.cache = DFGCache(cache_dir) if cache_dir is not None else DFGCache()
+        self.use_dfg = use_dfg
+        self.cache = (DFGCache(cache_dir) if cache_dir is not None else DFGCache()) if use_dfg else None
         self._a = self.table.column("code_a").to_pylist()
         self._b = self.table.column("code_b").to_pylist()
         self._t = self.table.column("ternary").to_pylist()
@@ -477,6 +501,23 @@ class PairDataset(Dataset):
         return len(self._a)
 
     def __getitem__(self, i: int) -> dict[str, torch.Tensor]:
+        label_idx = PAIR_LABEL_TO_IDX[self._t[i]]
+
+        if not self.use_dfg:
+            enc = self.tokenizer(
+                self._a[i], self._b[i],                # HF handles [CLS] A [SEP] B [SEP]
+                truncation="longest_first",
+                padding="max_length",
+                max_length=self.max_seq_len,
+                return_tensors="pt",
+            )
+            return {
+                "input_ids": enc["input_ids"][0],
+                "attention_mask": enc["attention_mask"][0],
+                "position_ids": torch.arange(self.max_seq_len, dtype=torch.long),
+                "labels": torch.tensor(label_idx, dtype=torch.long),
+            }
+
         key = f"pair:{self.max_seq_len}:{self.max_dfg_nodes}"
         cache_key = (self._a[i] + "\n---\n" + self._b[i]) + "|" + key
         cached = self.cache.get(cache_key)
@@ -491,7 +532,6 @@ class PairDataset(Dataset):
                 self.cache.put(cache_key, b)
             except OSError:
                 pass
-        label_idx = PAIR_LABEL_TO_IDX[self._t[i]]
         return {
             "input_ids": torch.from_numpy(b.input_ids),
             "position_ids": torch.from_numpy(b.position_ids),

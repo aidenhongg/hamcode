@@ -131,7 +131,7 @@ def main(repo_dir: Path, out: Path, audit_dir: Path,
             rejects.append({"dir": str(problem_dir), "reason": "no_readme"})
             continue
 
-        raw = find_complexity_in_text(readme, max_chars=8192)
+        raw = find_complexity_in_text(readme, max_chars=20000)
         if raw is None:
             rejects.append({"dir": str(problem_dir), "reason": "no_complexity_in_readme"})
             continue

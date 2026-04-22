@@ -102,9 +102,10 @@ class Config:
     wandb_project: str = "codebert-complexity"
     dry_run: bool = False
     resume_from: str = ""
-    num_workers: int = 8
+    num_workers: int = 4
     prefetch_factor: int = 4
     cache_dir: str = ""
+    use_dfg: bool = False   # DEFAULT: simple tokenization, no DFG. Set True for paper-faithful.
 
 
 def load_config(cli: argparse.Namespace) -> Config:
@@ -251,6 +252,10 @@ def main() -> int:
     ap.add_argument("--num_workers", type=int, default=None)
     ap.add_argument("--prefetch_factor", type=int, default=None)
     ap.add_argument("--cache_dir", default=None)
+    ap.add_argument("--use_dfg", action="store_true", default=None,
+                    help="Paper-faithful mode: tree-sitter DFG + 2D graph attention mask")
+    ap.add_argument("--no_dfg", dest="use_dfg", action="store_false",
+                    help="Simple mode (default): standard 1D tokenization, no DFG")
     args = ap.parse_args()
 
     cfg = load_config(args)
@@ -285,13 +290,18 @@ def main() -> int:
         DS = PairDataset
 
     logger.info("loading datasets from %s ...", data_root)
-    train_ds = DS(train_path, tokenizer, cfg.max_seq_len, cfg.max_dfg_nodes,
-                  cache_dir=cfg.cache_dir or None)
-    val_ds = DS(val_path, tokenizer, cfg.max_seq_len, cfg.max_dfg_nodes,
-                cache_dir=cfg.cache_dir or None)
-    test_ds = DS(test_path, tokenizer, cfg.max_seq_len, cfg.max_dfg_nodes,
-                 cache_dir=cfg.cache_dir or None)
-    logger.info("train=%d  val=%d  test=%d", len(train_ds), len(val_ds), len(test_ds))
+    ds_kwargs = dict(
+        tokenizer=tokenizer,
+        max_seq_len=cfg.max_seq_len,
+        max_dfg_nodes=cfg.max_dfg_nodes,
+        cache_dir=cfg.cache_dir or None,
+        use_dfg=cfg.use_dfg,
+    )
+    train_ds = DS(train_path, **ds_kwargs)
+    val_ds = DS(val_path, **ds_kwargs)
+    test_ds = DS(test_path, **ds_kwargs)
+    logger.info("train=%d  val=%d  test=%d  use_dfg=%s",
+                len(train_ds), len(val_ds), len(test_ds), cfg.use_dfg)
 
     if cfg.dry_run:
         # Cheap smoke mode
