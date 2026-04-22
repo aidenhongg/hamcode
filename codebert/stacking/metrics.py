@@ -117,7 +117,8 @@ def compute_all(
 
     if bert_pair_pred is not None:
         # Compare head vs bert baseline on the same filtered subset.
-        # bert_pair_pred uses ternary encoding; map A_faster->1, same->0 (matches our y).
+        # bert_pair_pred is already binary (0=same, 1=A_faster) after the rewrite —
+        # no remapping needed, it aligns 1:1 with our y.
         bert_acc = float(accuracy_score(y_true, bert_pair_pred))
         p_mc = mcnemar_p(bert_pair_pred, y_pred, y_true)
         out["bert_pairwise_baseline_comparison"] = {

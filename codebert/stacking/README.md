@@ -1,22 +1,27 @@
 # stacking — stacked head for pairwise complexity ranking
 
 Second-stage classifier on top of frozen GraphCodeBERT. Consumes pre-softmax
-logits (pointwise 11-d + pairwise 3-d), AST features (21 per snippet,
+logits (pointwise 11-d + **pairwise 2-d**), AST features (21 per snippet,
 differenced + |diff|), and CLS-cosine similarity; predicts the binary
-`same` vs `A_faster` label on the B>=A subset of pairs.
+`same` vs `A_faster` label.
 
 Target deployment: **RunPod RTX 5090** (32GB VRAM, bf16, CUDA 12.8+).
 End-to-end orchestrator: `stacking/scripts/run_runpod.sh`.
 
 ## Task
 
-Caller submits pairs in canonical order (B is same-speed-or-slower than A).
-Head outputs:
+**The pairwise BERT head is now binary, not ternary.** The pipeline
+canonicalizes every pair so tier_A <= tier_B — given any candidate
+(a, b), if tier_a > tier_b they are swapped. After the rewrite the
+dataset contains only two classes:
 
 - `0 = same`     — A and B are in the same complexity tier
-- `1 = A_faster` — B is strictly slower than A
+- `1 = A_faster` — B is strictly slower than A (i.e. f(A) ∈ o(f(B)))
 
-Pairs with B_faster are filtered out of training and test splits.
+Callers of head inference must submit pairs in canonical order
+(B is same-speed-or-slower than A). `pipeline/10_make_pairwise.py`
+enforces this at data-generation time; `stacking/dataset.filter_b_ge_a`
+remains as a defensive safety net.
 
 ## Leakage fix (vs. original plan)
 
@@ -103,13 +108,14 @@ bash run_pipeline.sh
 python -m stacking.features.ast_features \
     --in_splits data/processed --out_dir runs/heads/extraction
 
-# 3. OOF pointwise BERT (leakage-fixed)
-#    5 folds + final full-train model = 6 pointwise training runs (~60 min on 5090)
+# 3. OOF pointwise BERT (leakage-fixed, 8-epoch cap)
+#    5 folds + final full-train model = 6 pointwise training runs (~45 min on 5090)
 python -m stacking.features.oof_point \
     --data_dir data/processed \
     --out_dir runs/heads/extraction \
     --n_folds 5 \
     --epochs 8 --batch_size 16 --grad_accum 2 --lr 2e-5 --bf16 \
+    --eval_every_steps 100 --patience 2 \
     --extract_batch 64 --resume
 
 # 4. CLS cosine similarity
@@ -117,13 +123,14 @@ python -m stacking.features.semantic \
     --in_splits data/processed \
     --extraction_dir runs/heads/extraction
 
-# 5. OOF pairwise BERT (leakage-fixed)
+# 5. OOF pairwise BERT (binary task, 8-epoch cap)
 #    Warm-starts from the OOF pointwise full encoder for faster convergence.
 python -m stacking.features.oof_pair \
     --data_dir data/processed \
     --out_dir runs/heads/extraction \
     --n_folds 5 \
-    --epochs 6 --batch_size 12 --grad_accum 2 --lr 1e-5 --bf16 \
+    --epochs 8 --batch_size 12 --grad_accum 2 --lr 1e-5 --bf16 \
+    --eval_every_steps 100 --patience 2 \
     --label_smoothing 0.05 --class_weights none \
     --warm_start_from runs/heads/extraction/oof/full/best \
     --extract_batch 32 --resume
@@ -146,8 +153,8 @@ chunk. Fold outputs live at `runs/heads/extraction/oof/fold_<k>/` and
 ## BERT variants (head features)
 
 - `v1` — A + B pointwise logits with [raw A; raw B; diff; |diff|] (44 dims BERT)
-- `v2` — pairwise logit only (3 dims BERT)
-- `v3` — v1 + v2 combined (47 dims BERT)
+- `v2` — pairwise logit only (**2 dims** BERT after the binary rewrite)
+- `v3` — v1 + v2 combined (**46 dims** BERT)
 
 All variants also include the 84-dim AST diff block + 4-dim CLS similarity block.
 

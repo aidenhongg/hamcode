@@ -34,7 +34,11 @@ class PairRecord:
     code_b: str
     label_a: str
     label_b: str
-    ternary: str                 # A_faster | same | B_faster
+    # Binary pair label post-rewrite: "same" | "A_faster" (= B is strictly slower).
+    # The column name stays "ternary" for parquet schema compatibility with
+    # earlier extractions; the *values* are binary now. Upstream canonicalization
+    # guarantees tier_A <= tier_B so "B_faster" is never emitted.
+    ternary: str
     same_problem: bool
     tokens_combined: int
     split: str = "train"

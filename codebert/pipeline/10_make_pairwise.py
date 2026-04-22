@@ -1,7 +1,14 @@
 """Generate pairwise pairs: same-problem (gold) + cross-problem (synthetic).
 
 Pairs respect split boundaries — a train pair uses only train snippets.
-Ordinal tier map from common/labels is used to derive the ternary label.
+Every emitted pair is canonicalized so tier_A <= tier_B (B is same-speed or
+slower than A). The resulting `ternary` column therefore contains only
+"same" or "A_faster" — never "B_faster" — making the downstream BERT
+classifier a binary task.
+
+Canonicalization: given candidate (a, b), if tier_a > tier_b we swap them.
+This preserves every sampled pair (no discards) while enforcing the
+ordering contract.
 """
 
 from __future__ import annotations
@@ -20,8 +27,15 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-from common.labels import POINT_LABELS, pair_label_from_labels
+from common.labels import POINT_LABELS, TIER, pair_label_from_labels
 from common.schemas import PAIR_SCHEMA
+
+
+def _canonicalize(a: dict, b: dict) -> tuple[dict, dict]:
+    """Return (a, b) reordered so tier_A <= tier_B. Swap if needed."""
+    if TIER[a["label"]] > TIER[b["label"]]:
+        return b, a
+    return a, b
 
 
 def main() -> int:
@@ -53,7 +67,7 @@ def main() -> int:
         cells = [(la, lb) for i, la in enumerate(POINT_LABELS) for lb in POINT_LABELS[i:]]
         per_cell = max(1, split_target // max(1, len(cells)))
 
-        # same-problem pairs
+        # same-problem pairs (canonicalized: tier_A <= tier_B always)
         by_pid: dict[str, list[dict]] = defaultdict(list)
         for r in rows:
             if r["problem_id"]:
@@ -61,6 +75,7 @@ def main() -> int:
         sp_pairs: list[tuple[dict, dict, bool]] = []
         for _pid, items in by_pid.items():
             for a, b in itertools.combinations(items, 2):
+                a, b = _canonicalize(a, b)
                 sp_pairs.append((a, b, True))
 
         # cross-problem pairs, uniform per (class_a, class_b) cell
@@ -85,6 +100,7 @@ def main() -> int:
                     continue
                 if a["problem_id"] and a["problem_id"] == b["problem_id"]:
                     continue
+                a, b = _canonicalize(a, b)
                 cross_pairs.append((a, b, False))
                 added += 1
 
@@ -92,14 +108,20 @@ def main() -> int:
         rng.shuffle(cross_pairs)
 
         for a, b, same_prob in sp_pairs + cross_pairs:
-            ternary = pair_label_from_labels(a["label"], b["label"])
+            label = pair_label_from_labels(a["label"], b["label"])
+            # Canonicalization guarantees label is never "B_faster" — assert it
+            # so any future caller that bypasses _canonicalize fails loudly.
+            assert label in ("same", "A_faster"), (
+                f"non-canonical pair survived filter: {a['label']!r} vs {b['label']!r}"
+            )
             all_rows.append({
                 "pair_id": f"p{pair_idx:07d}",
                 "code_a": a["code"],
                 "code_b": b["code"],
                 "label_a": a["label"],
                 "label_b": b["label"],
-                "ternary": ternary,
+                "ternary": label,        # column kept named 'ternary' for schema
+                                         # compatibility; values are binary now.
                 "same_problem": same_prob,
                 "tokens_combined": int(a.get("tokens_graphcodebert") or 0)
                                    + int(b.get("tokens_graphcodebert") or 0),

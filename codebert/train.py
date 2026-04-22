@@ -345,7 +345,8 @@ def main() -> int:
 
     # Balanced sampling: inverse-frequency over-sampling so every batch is ~class-balanced.
     # Complementary to class_weights in loss (both can be on). Only wire for --point;
-    # pairwise labels (A_faster/same/B_faster) are usually close-to-balanced by construction.
+    # pairwise labels are binary (same / A_faster) post-rewrite — skew is typically
+    # ~2-3:1 which class_weight handles without needing a sampler.
     train_sampler = None
     train_shuffle = True
     if cfg.task == "point" and cfg.balanced_sampler:

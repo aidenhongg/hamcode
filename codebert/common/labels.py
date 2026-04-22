@@ -38,16 +38,26 @@ TIER: dict[str, int] = {
 }
 assert set(TIER) == set(POINT_LABELS), "TIER must cover all 11 classes"
 
-# Ternary pairwise labels. Stable order for the classification head.
-PAIR_LABELS: tuple[str, ...] = ("A_faster", "same", "B_faster")
+# Binary pairwise labels. The pair task is restricted to the B-same-or-slower
+# subset (tier_B >= tier_A). Within that subset only two outcomes are possible:
+#   - "same"      : tier_A == tier_B  (A and B share complexity tier)
+#   - "A_faster"  : tier_A <  tier_B  (A is strictly faster, i.e. B strictly slower)
+# Pairs with tier_A > tier_B are rejected upstream (pipeline/10_make_pairwise.py
+# canonicalizes by swapping so every emitted pair satisfies tier_A <= tier_B).
+# Stable order — PAIR_LABELS[i] is the label for class index i.
+PAIR_LABELS: tuple[str, ...] = ("same", "A_faster")
 NUM_PAIR_LABELS = len(PAIR_LABELS)
 PAIR_LABEL_TO_IDX: dict[str, int] = {lab: i for i, lab in enumerate(PAIR_LABELS)}
 
 
 def pair_label_from_labels(label_a: str, label_b: str) -> str:
+    """Return the binary pair label, or 'B_faster' if the pair violates the
+    canonical ordering (tier_A > tier_B). Callers must filter/swap such pairs
+    before emitting them into the dataset.
+    """
     ta, tb = TIER[label_a], TIER[label_b]
     if ta < tb:
         return "A_faster"
     if ta > tb:
-        return "B_faster"
+        return "B_faster"   # signal: swap or drop upstream
     return "same"

@@ -76,7 +76,8 @@ def _point_logit_columns(n_labels: int = 11) -> list[str]:
     return [f"point_logit_{k}" for k in range(n_labels)]
 
 
-def _pair_logit_columns(n_labels: int = 3) -> list[str]:
+def _pair_logit_columns(n_labels: int = 2) -> list[str]:
+    # Default 2 after the binary-pair rewrite (was 3 under ternary head).
     return [f"pair_logit_{k}" for k in range(n_labels)]
 
 

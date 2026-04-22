@@ -7,9 +7,9 @@ Pointwise:
   - within-1-tier accuracy (soft correct — classes have a natural order)
   - confusion matrix
 
-Pairwise:
+Pairwise (binary after the rewrite — classes: same / A_faster):
   - accuracy
-  - ternary macro-F1 (primary)
+  - binary macro-F1 (primary)
   - confusion matrix
 
 Extras:

@@ -137,22 +137,22 @@ python -m stacking.features.ast_features \
     --out_dir "$EXTRACTION_DIR"
 
 if [ "$SKIP_POINT" -eq 0 ]; then
-    echo "=== [4/6] OOF pointwise BERT (leakage fix) ==="
+    echo "=== [4/6] OOF pointwise BERT (leakage fix, 8-epoch cap) ==="
     # Tuned for 5090 / 32GB VRAM. Warm-starts off fresh GraphCodeBERT-base per
-    # fold. Epochs is a generous upper bound — patience=3 is the real stopper.
+    # fold. 8-epoch cap + patience=2 keeps OOF wallclock bounded.
     python -m stacking.features.oof_point \
         --data_dir data/processed \
         --out_dir "$EXTRACTION_DIR" \
         --n_folds "$N_FOLDS" \
-        --epochs 50 \
+        --epochs 8 \
         --batch_size 16 \
         --grad_accum 2 \
         --lr 2e-5 \
         --bf16 \
         --num_workers 4 \
         --max_seq_len 512 \
-        --eval_every_steps 200 \
-        --patience 3 \
+        --eval_every_steps 100 \
+        --patience 2 \
         --extract_batch 64 \
         --resume
 else
@@ -165,14 +165,15 @@ python -m stacking.features.semantic \
     --extraction_dir "$EXTRACTION_DIR"
 
 if [ "$SKIP_PAIR" -eq 0 ]; then
-    echo "=== [6/6a] OOF pairwise BERT (leakage fix) ==="
-    # Warm-starts from the OOF full pointwise encoder (matches legacy recipe).
-    # Epochs is a generous upper bound — patience=3 is the real stopper.
+    echo "=== [6/6a] OOF pairwise BERT (binary task, 8-epoch cap) ==="
+    # Warm-starts from the OOF full pointwise encoder. Pair head is now binary
+    # (0=same, 1=A_faster) — ternary has been fully removed. 8-epoch cap +
+    # patience=2 keeps OOF wallclock bounded.
     python -m stacking.features.oof_pair \
         --data_dir data/processed \
         --out_dir "$EXTRACTION_DIR" \
         --n_folds "$N_FOLDS" \
-        --epochs 30 \
+        --epochs 8 \
         --batch_size 12 \
         --grad_accum 2 \
         --lr 1e-5 \
@@ -181,8 +182,8 @@ if [ "$SKIP_PAIR" -eq 0 ]; then
         --bf16 \
         --num_workers 4 \
         --max_seq_len 512 \
-        --eval_every_steps 200 \
-        --patience 3 \
+        --eval_every_steps 100 \
+        --patience 2 \
         --extract_batch 32 \
         --warm_start_from "$EXTRACTION_DIR/oof/full/best" \
         --resume

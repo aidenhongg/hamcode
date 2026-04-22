@@ -41,34 +41,32 @@ from stacking.heads.base import HeadRegistry, compute_class_weight
 from stacking import metrics as M
 
 
-# Map pair-BERT ternary label to our binary scheme, for baseline comparison.
-# In the filtered subset, BERT can only output A_faster or same to be correct;
-# if it outputs B_faster we treat that as "same" (wrong direction by definition
-# in this subset — the most meaningful head baseline).
-_TERNARY_TO_BINARY = {"A_faster": 1, "same": 0, "B_faster": 0}
-
-
 def _bert_baseline_preds(pair_tbl, pair_logits_tbl, pair_ids: list[str]) -> np.ndarray:
-    """BERT pairwise model's argmax prediction, mapped to binary (y = same/A_faster)."""
-    cols = [c for c in ["pair_logit_0", "pair_logit_1", "pair_logit_2"]
-            if c in pair_logits_tbl.schema.names]
-    if len(cols) != 3:
+    """BERT pairwise model's argmax prediction on the binary task.
+
+    After the binary-pair rewrite the pair model emits 2 logits in
+    PAIR_LABELS order = (same, A_faster) — so argmax IS already the
+    binary label we want (0=same, 1=A_faster). No re-mapping needed.
+
+    Falls back to zeros if pair logits are missing or have an
+    unexpected number of columns (e.g. a legacy ternary extraction
+    left over from before the rewrite — surface the mismatch but
+    don't crash the sweep).
+    """
+    cols = [f"pair_logit_{k}" for k in range(2) if f"pair_logit_{k}" in pair_logits_tbl.schema.names]
+    if len(cols) != 2:
         return np.zeros(len(pair_ids), dtype=np.int64)
     id_to_row = {id_: i for i, id_ in enumerate(pair_logits_tbl.column("pair_id").to_pylist())}
     raw = np.stack(
         [np.asarray(pair_logits_tbl.column(c).to_pylist(), dtype=np.float32) for c in cols],
         axis=1,
     )
-    # Pair labels order in training (see common/labels.py): ("A_faster", "same", "B_faster")
-    label_order = ("A_faster", "same", "B_faster")
     out = np.zeros(len(pair_ids), dtype=np.int64)
     for i, pid in enumerate(pair_ids):
         r = id_to_row.get(pid)
         if r is None:
-            out[i] = 0
             continue
-        argmax = int(np.argmax(raw[r]))
-        out[i] = _TERNARY_TO_BINARY[label_order[argmax]]
+        out[i] = int(np.argmax(raw[r]))
     return out
 
 

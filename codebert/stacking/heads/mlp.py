@@ -34,9 +34,9 @@ class MLPHead:
         dropout: float = 0.3,
         lr: float = 1e-3,
         weight_decay: float = 1e-4,
-        epochs: int = 50,
+        epochs: int = 8,            # tight cap — head sweep budget
         batch_size: int = 256,
-        patience: int = 5,
+        patience: int = 3,
         device: str | None = None,
     ) -> None:
         self.hp = dict(
