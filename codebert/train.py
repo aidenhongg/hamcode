@@ -36,6 +36,7 @@ import yaml
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 logger = logging.getLogger("train")
@@ -101,7 +102,8 @@ class Config:
     wandb_project: str = "codebert-complexity"
     dry_run: bool = False
     resume_from: str = ""
-    num_workers: int = 2
+    num_workers: int = 8
+    prefetch_factor: int = 4
     cache_dir: str = ""
 
 
@@ -160,8 +162,9 @@ def evaluate(model, loader, device, task: str, max_batches: int | None = None) -
     model.eval()
     all_preds: list[int] = []
     all_labels: list[int] = []
+    iterable = tqdm(loader, desc="eval", leave=False, dynamic_ncols=True, mininterval=1.0)
     with torch.no_grad():
-        for i, batch in enumerate(loader):
+        for i, batch in enumerate(iterable):
             if max_batches is not None and i >= max_batches:
                 break
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
@@ -174,6 +177,7 @@ def evaluate(model, loader, device, task: str, max_batches: int | None = None) -
             labels = batch["labels"].cpu().tolist()
             all_preds.extend(preds)
             all_labels.extend(labels)
+    iterable.close() if hasattr(iterable, "close") else None
     if task == "point":
         return pointwise_metrics(all_preds, all_labels)
     return pairwise_metrics(all_preds, all_labels)
@@ -245,6 +249,7 @@ def main() -> int:
     ap.add_argument("--dry_run", action="store_true", default=None)
     ap.add_argument("--resume_from", default=None)
     ap.add_argument("--num_workers", type=int, default=None)
+    ap.add_argument("--prefetch_factor", type=int, default=None)
     ap.add_argument("--cache_dir", default=None)
     args = ap.parse_args()
 
@@ -259,11 +264,14 @@ def main() -> int:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("device: %s", device)
     if device.type == "cuda":
-        logger.info("gpu: %s", torch.cuda.get_device_name(0))
+        logger.info("gpu: %s  (%.1fGB)", torch.cuda.get_device_name(0),
+                    torch.cuda.get_device_properties(0).total_memory / 1e9)
 
     # --- data -----
+    logger.info("loading tokenizer (%s) ...", cfg.model_name)
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
     data_root = Path(cfg.data_dir)
+    logger.info("tokenizer ready (vocab=%d)", tokenizer.vocab_size)
 
     if cfg.task == "point":
         train_path = data_root / "train.parquet"
@@ -276,12 +284,14 @@ def main() -> int:
         test_path = data_root / "pair_test.parquet"
         DS = PairDataset
 
+    logger.info("loading datasets from %s ...", data_root)
     train_ds = DS(train_path, tokenizer, cfg.max_seq_len, cfg.max_dfg_nodes,
                   cache_dir=cfg.cache_dir or None)
     val_ds = DS(val_path, tokenizer, cfg.max_seq_len, cfg.max_dfg_nodes,
                 cache_dir=cfg.cache_dir or None)
     test_ds = DS(test_path, tokenizer, cfg.max_seq_len, cfg.max_dfg_nodes,
                  cache_dir=cfg.cache_dir or None)
+    logger.info("train=%d  val=%d  test=%d", len(train_ds), len(val_ds), len(test_ds))
 
     if cfg.dry_run:
         # Cheap smoke mode
@@ -292,22 +302,28 @@ def main() -> int:
         cfg.epochs = 1
 
     collate = make_collator()
-    dl_train = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True,
-                          collate_fn=collate, num_workers=cfg.num_workers,
-                          pin_memory=device.type == "cuda")
-    dl_val = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False,
-                        collate_fn=collate, num_workers=cfg.num_workers,
-                        pin_memory=device.type == "cuda")
-    dl_test = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False,
-                         collate_fn=collate, num_workers=cfg.num_workers,
-                         pin_memory=device.type == "cuda")
+    dl_kwargs = dict(
+        collate_fn=collate,
+        num_workers=cfg.num_workers,
+        pin_memory=device.type == "cuda",
+        persistent_workers=cfg.num_workers > 0,
+        prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
+    )
+    dl_train = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, **dl_kwargs)
+    dl_val = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False, **dl_kwargs)
+    dl_test = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False, **dl_kwargs)
+    logger.info("DataLoader: bs=%d num_workers=%d prefetch_factor=%d pin_memory=%s",
+                cfg.batch_size, cfg.num_workers, cfg.prefetch_factor,
+                device.type == "cuda")
 
     # --- model -----
+    logger.info("building model (%s, task=%s) ...", cfg.model_name, cfg.task)
     model = build_model(cfg.model_name, cfg.task)
     if cfg.warm_start_from:
         miss, unex = model.load_warm_start_encoder(cfg.warm_start_from)
         logger.info("warm-start from %s (missing=%d unexpected=%d)",
                     cfg.warm_start_from, len(miss), len(unex))
+    logger.info("moving model to %s ...", device)
     model = model.to(device)
     n_params = sum(p.numel() for p in model.parameters())
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -359,12 +375,23 @@ def main() -> int:
     best_epoch = -1
     patience = 0
 
+    logger.info("starting training: %d epochs, %d total steps, warmup=%d",
+                cfg.epochs, total_steps, warmup)
+    logger.info("(first epoch's early steps are slow while tree-sitter builds the DFG cache)")
+
     # --- train loop -----
     try:
         for epoch in range(start_epoch, cfg.epochs):
             model.train()
             optimizer.zero_grad(set_to_none=True)
-            for local_step, batch in enumerate(dl_train):
+            pbar = tqdm(
+                dl_train,
+                desc=f"epoch {epoch+1}/{cfg.epochs}",
+                dynamic_ncols=True,
+                leave=True,
+                mininterval=1.0,
+            )
+            for local_step, batch in enumerate(pbar):
                 batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
                 if use_bf16:
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -391,7 +418,12 @@ def main() -> int:
                     loss_val = float(loss.item() * cfg.grad_accum)
                     loss_log.write(json.dumps({"step": step, "epoch": epoch, "loss": loss_val,
                                                "lr": scheduler.get_last_lr()[0]}) + "\n")
-                    if step % max(1, cfg.eval_every_steps // 10) == 0:
+                    pbar.set_postfix(step=step, loss=f"{loss_val:.3f}",
+                                     lr=f"{scheduler.get_last_lr()[0]:.2e}")
+                    # Verbose early so the user sees progress while DFG cache warms up;
+                    # taper to 1/20 the eval cadence after the first 10 global steps.
+                    log_interval = 1 if step <= 10 else max(1, cfg.eval_every_steps // 10)
+                    if step % log_interval == 0:
                         logger.info("epoch=%d step=%d lr=%.2e loss=%.4f",
                                     epoch, step, scheduler.get_last_lr()[0], loss_val)
                     if step > 0 and step % cfg.eval_every_steps == 0:
@@ -418,6 +450,7 @@ def main() -> int:
                                 return _final_report(model, dl_test, device, cfg.task, out_root, cfg)
                         model.train()
 
+            pbar.close()
             save_state(model, optimizer, scheduler, scaler, step, epoch, out_root / "last")
     except Exception:
         logger.error("training loop failed:\n%s", traceback.format_exc())

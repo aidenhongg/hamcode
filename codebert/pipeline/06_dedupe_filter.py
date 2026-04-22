@@ -16,7 +16,12 @@ import ast
 import hashlib
 import json
 import sys
+import warnings
 from pathlib import Path
+
+# Silence Py3.12's noisy "invalid escape sequence" SyntaxWarnings emitted by
+# ast.parse() on LeetCode solutions that embed regex patterns in strings.
+warnings.filterwarnings("ignore", category=SyntaxWarning)
 
 _THIS = Path(__file__).resolve()
 sys.path.insert(0, str(_THIS.parent.parent))
@@ -42,7 +47,11 @@ def _minhash(tokens: set[str], num_perm: int = 64) -> MinHash:
 def _load_gcb_tokenizer():
     try:
         from transformers import AutoTokenizer  # type: ignore
+        import transformers.utils.logging as hf_logging  # type: ignore
+        hf_logging.set_verbosity_error()   # silence per-sample "too long" spam
         tok = AutoTokenizer.from_pretrained("microsoft/graphcodebert-base")
+        # Bump effective max so the tokenizer doesn't warn on samples we'll drop anyway.
+        tok.model_max_length = 1_000_000
         return tok
     except Exception as e:
         print(f"[06] tokenizer unavailable ({e}); falling back to char heuristic", flush=True)

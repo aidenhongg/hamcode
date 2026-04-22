@@ -42,14 +42,18 @@ def looks_like_python(code: str) -> bool:
 
 
 def write_points(records: Iterable[PointRecord], path: Path) -> int:
-    """Write PointRecord iterable to parquet. Returns count written."""
-    rows = []
-    for r in records:
-        rows.append(r.to_dict())
+    """Write PointRecord iterable to parquet. Always writes a file (possibly
+    empty) so downstream orchestrators can distinguish "source ran but
+    produced nothing" from "source never ran".
+    """
+    rows = [r.to_dict() for r in records]
+    path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
+        # Write an empty parquet with the correct schema
+        empty = pa.Table.from_pylist([], schema=POINT_SCHEMA)
+        pq.write_table(empty, path, compression="snappy")
         return 0
     table = pa.Table.from_pylist(rows, schema=POINT_SCHEMA)
-    path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(table, path, compression="snappy")
     return len(rows)
 
@@ -81,7 +85,9 @@ _O_EXPR = r"""
 
 _PREFIX_COMPLEXITY_RE = re.compile(
     rf"""
-    (?:time\s*(?:complexity)?\s*[:\-=])      # 'Time:' / 'Time complexity:' / 'Time -'
+    \btime\s*(?:complexity)?                 # 'time' / 'time complexity'
+    \s*
+    (?:[:\-=]|\bis\b|\bof\b|\:)              # separator: ':', '-', '=', 'is', 'of'
     \s*
     (?P<expr>{_O_EXPR})
     """,
@@ -97,13 +103,35 @@ _SUFFIX_COMPLEXITY_RE = re.compile(
 )
 
 
-def find_complexity_in_text(text: str, max_chars: int = 2048) -> str | None:
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_LATEX_MATH_DELIM_RE = re.compile(r"\$+")
+
+
+def strip_markup(text: str) -> str:
+    """Strip HTML tags and LaTeX math delimiters so the complexity regex can
+    match annotations like `$O(n^2)$` or `<code>O(n)</code>` uniformly.
+
+    Also rewrites common HTML-encoded complexity forms:
+        O(n<sup>2</sup>) -> O(n^2)
+        O(n&nbsp;log&nbsp;n) -> O(n log n)
+    """
+    # Inline superscripts BEFORE stripping other tags
+    text = re.sub(r"<sup>\s*(\d+)\s*</sup>", r"^\1", text)
+    text = _HTML_TAG_RE.sub(" ", text)
+    text = text.replace("&nbsp;", " ")
+    text = text.replace("&times;", "*")
+    text = _LATEX_MATH_DELIM_RE.sub("", text)
+    return text
+
+
+def find_complexity_in_text(text: str, max_chars: int = 4096) -> str | None:
     """Search for the first complexity annotation in the first `max_chars` of text.
 
-    Tries the prefix form first ("Time complexity: O(...)"), then the suffix
-    form ("O(...) time"). Returns the raw O(...) string or None.
+    Strips HTML and LaTeX math delimiters first, then tries prefix form
+    ("Time complexity: O(...)") and suffix form ("O(...) time").
+    Returns the raw O(...) string or None.
     """
-    head = text[:max_chars]
+    head = strip_markup(text[:max_chars])
     m = _PREFIX_COMPLEXITY_RE.search(head)
     if m:
         return m.group("expr").strip()

@@ -15,6 +15,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Make the project root importable when this script is run directly.
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
 import click
 import pandas as pd
 
@@ -40,11 +45,12 @@ def _run_module(module: str, extra_args: list[str]) -> int:
 @click.option("--codecomplex-offline", is_flag=True,
               help="Pass --offline to the codecomplex ingest (use local data only).")
 @click.option("--codeforces-submissions-limit", type=int, default=200_000)
-@click.option("--doocs-max-files", type=int, default=None)
+@click.option("--doocs-max-problems", type=int, default=None,
+              help="Cap number of LeetCode problems scanned.")
 @click.option("--out", type=click.Path(path_type=Path),
               default=INTERIM / "all.parquet")
 def main(skip: tuple[str, ...], codecomplex_offline: bool,
-         codeforces_submissions_limit: int, doocs_max_files: int | None,
+         codeforces_submissions_limit: int, doocs_max_problems: int | None,
          out: Path) -> None:
 
     for name, module in SOURCES:
@@ -56,8 +62,8 @@ def main(skip: tuple[str, ...], codecomplex_offline: bool,
             args.append("--offline")
         if name == "codeforces":
             args.extend(["--submissions-limit", str(codeforces_submissions_limit)])
-        if name == "doocs_leetcode" and doocs_max_files is not None:
-            args.extend(["--max-files", str(doocs_max_files)])
+        if name == "doocs_leetcode" and doocs_max_problems is not None:
+            args.extend(["--max-problems", str(doocs_max_problems)])
         rc = _run_module(module, args)
         if rc != 0:
             click.echo(f"[01_ingest] {name} exited with code {rc} — continuing")

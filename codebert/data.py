@@ -20,9 +20,20 @@ from __future__ import annotations
 
 import hashlib
 import os
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+
+# AST on LeetCode code occasionally triggers Py3.12 invalid-escape warnings.
+# The tokenizer fires a "too long" warning per over-budget sample. Both are
+# expected and handled downstream — suppress so training logs stay readable.
+warnings.filterwarnings("ignore", category=SyntaxWarning)
+try:
+    import transformers.utils.logging as _hf_log  # type: ignore
+    _hf_log.set_verbosity_error()
+except Exception:
+    pass
 
 import numpy as np
 import pyarrow.parquet as pq

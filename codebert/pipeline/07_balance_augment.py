@@ -17,7 +17,10 @@ import json
 import random
 import re
 import sys
+import warnings
 from pathlib import Path
+
+warnings.filterwarnings("ignore", category=SyntaxWarning)
 
 _THIS = Path(__file__).resolve()
 sys.path.insert(0, str(_THIS.parent.parent))

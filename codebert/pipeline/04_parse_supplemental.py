@@ -18,7 +18,10 @@ import json
 import random
 import re
 import sys
+import warnings
 from pathlib import Path
+
+warnings.filterwarnings("ignore", category=SyntaxWarning)
 
 # -----------------------------------------------------------------------------
 # Templates. Dedent is handled; keep them parse-clean.
