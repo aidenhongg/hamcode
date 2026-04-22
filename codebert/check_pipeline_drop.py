@@ -44,14 +44,17 @@ def main() -> int:
 
     # Sources
     leetcode_parsed = count_jsonl(Path("data/interim/parsed/leetcode.jsonl"))
+    codeforces_parsed = count_jsonl(Path("data/interim/parsed/codeforces.jsonl"))
     codecomplex_parsed = count_jsonl(Path("data/interim/parsed/codecomplex.jsonl"))
     supplemental_parsed = count_jsonl(Path("data/interim/parsed/supplemental.jsonl"))
-    total_parsed = leetcode_parsed + codecomplex_parsed + supplemental_parsed
+    total_parsed = (leetcode_parsed + codeforces_parsed
+                    + codecomplex_parsed + supplemental_parsed)
 
-    print(f"  [02] leetcode parsed:        {leetcode_parsed:>6}")
-    print(f"  [03] codecomplex parsed:     {codecomplex_parsed:>6}")
-    print(f"  [04] supplemental parsed:    {supplemental_parsed:>6}")
-    print(f"       TOTAL PARSED:           {total_parsed:>6}")
+    print(f"  [02]  leetcode parsed:        {leetcode_parsed:>6}")
+    print(f"  [02b] codeforces parsed:      {codeforces_parsed:>6}")
+    print(f"  [03]  codecomplex parsed:     {codecomplex_parsed:>6}")
+    print(f"  [04]  supplemental parsed:    {supplemental_parsed:>6}")
+    print(f"        TOTAL PARSED:           {total_parsed:>6}")
 
     # Parse failures
     lc_fail = count_jsonl(Path("data/audit/leetcode_parse_failures.jsonl"))

@@ -59,11 +59,11 @@ def write_points(records: Iterable[PointRecord], path: Path) -> int:
 
 
 def write_rejects(rejects: list[dict], path: Path) -> int:
-    """Append reject log entries as JSONL for audit."""
-    if not rejects:
-        return 0
+    """Write reject log entries as JSONL for audit. OVERWRITES previous runs'
+    rejects so diagnostic tools see only the current run.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as f:
+    with path.open("w", encoding="utf-8") as f:
         for r in rejects:
             f.write(json.dumps(r) + "\n")
     return len(rejects)
@@ -92,6 +92,18 @@ _PREFIX_COMPLEXITY_RE = re.compile(
     (?P<expr>{_O_EXPR})
     """,
     re.IGNORECASE | re.VERBOSE,
+)
+
+# Chinese time-complexity prefix. doocs/leetcode's Chinese READMEs use phrases
+# like "时间复杂度为 O(n)" or "时间复杂度：O(n)". 237 problems in doocs only have
+# Chinese READMEs, so this pattern unlocks that data.
+_CH_COMPLEXITY_RE = re.compile(
+    rf"""
+    时间复杂度                               # Chinese: 'time complexity'
+    [^O\n]{{0,20}}                           # up to 20 chars: '为', ':', '：', spaces
+    (?P<expr>{_O_EXPR})
+    """,
+    re.VERBOSE,
 )
 
 _SUFFIX_COMPLEXITY_RE = re.compile(
@@ -127,12 +139,17 @@ def strip_markup(text: str) -> str:
 def find_complexity_in_text(text: str, max_chars: int = 4096) -> str | None:
     """Search for the first complexity annotation in the first `max_chars` of text.
 
-    Strips HTML and LaTeX math delimiters first, then tries prefix form
-    ("Time complexity: O(...)") and suffix form ("O(...) time").
+    Strips HTML and LaTeX math delimiters first, then tries:
+      1. English prefix form ("Time complexity: O(...)")
+      2. Chinese prefix form ("时间复杂度: O(...)")
+      3. English suffix form ("O(...) time")
     Returns the raw O(...) string or None.
     """
     head = strip_markup(text[:max_chars])
     m = _PREFIX_COMPLEXITY_RE.search(head)
+    if m:
+        return m.group("expr").strip()
+    m = _CH_COMPLEXITY_RE.search(head)
     if m:
         return m.group("expr").strip()
     m = _SUFFIX_COMPLEXITY_RE.search(head)

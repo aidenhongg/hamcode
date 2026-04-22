@@ -60,21 +60,27 @@ def _extract_problem_id(path: Path) -> str | None:
 
 
 def _iter_problem_dirs(repo_dir: Path):
-    """Yield each problem directory that contains a README_EN.md."""
+    """Yield each problem directory with a README. English preferred; falls back
+    to Chinese README.md for problems that don't have an EN version. Each dir
+    yielded exactly once.
+    """
+    seen: set[Path] = set()
     for root in ("solution", "lcof", "lcof2", "lcci", "lcp"):
         base = repo_dir / root
         if not base.exists():
             continue
         for readme in base.rglob("README_EN.md"):
-            yield readme.parent
-    # Also try the Chinese README as fallback if EN missing in that dir
-    for root in ("solution",):
+            if readme.parent not in seen:
+                seen.add(readme.parent)
+                yield readme.parent
+    for root in ("solution", "lcof", "lcof2", "lcci", "lcp"):
         base = repo_dir / root
         if not base.exists():
             continue
         for readme in base.rglob("README.md"):
-            if (readme.parent / "README_EN.md").exists():
-                continue  # already processed via EN
+            if readme.parent in seen:
+                continue
+            seen.add(readme.parent)
             yield readme.parent
 
 

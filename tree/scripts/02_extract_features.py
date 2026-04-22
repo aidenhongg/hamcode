@@ -31,8 +31,14 @@ import pandas as pd
 import yaml
 from tqdm import tqdm
 
+from complexity.cp_preprocess import is_template_heavy, preprocess as cp_preprocess
 from complexity.features import FEATURE_NAMES, extract_features_with_ast_count
 from complexity.split import assign_splits, class_distribution
+
+
+# Sources whose code is wrapped in competitive-programming boilerplate and must
+# be stripped before feature extraction to avoid inflated loop/method counts.
+_CP_STYLE_SOURCES = frozenset({"codecomplex", "codeforces"})
 
 
 @click.command()
@@ -55,6 +61,8 @@ def main(input_path: Path, config: Path, out: Path, audit_dir: Path) -> None:
     rejects: list[dict] = []
     rows: list[dict] = []
 
+    cp_stripped = 0
+    cp_filtered = 0
     for _, row in tqdm(df.iterrows(), total=len(df), desc="extract"):
         code = row["code"]
         if not isinstance(code, str) or not code:
@@ -64,8 +72,23 @@ def main(input_path: Path, config: Path, out: Path, audit_dir: Path) -> None:
             rejects.append({"id": row.get("id"), "reason": "too_long",
                             "chars": len(code)})
             continue
+        # For Codeforces-style sources:
+        #   - If the code is dominated by a pasted template library, drop the row
+        #     entirely. Our features can't see through library code.
+        #   - Otherwise, strip light boilerplate (imports, one-line I/O helpers,
+        #     T-harness) before extraction. Original code stays in PointRecord.code.
+        feat_code = code
+        if row.get("source") in _CP_STYLE_SOURCES:
+            if is_template_heavy(code):
+                cp_filtered += 1
+                rejects.append({"id": row.get("id"), "reason": "cp_template_heavy"})
+                continue
+            stripped = cp_preprocess(code)
+            if stripped != code:
+                cp_stripped += 1
+                feat_code = stripped
         try:
-            feats, ast_n = extract_features_with_ast_count(code)
+            feats, ast_n = extract_features_with_ast_count(feat_code)
         except Exception as e:
             rejects.append({"id": row.get("id"), "reason": "parse_error",
                             "error": str(e)})
@@ -78,6 +101,8 @@ def main(input_path: Path, config: Path, out: Path, audit_dir: Path) -> None:
         out_row.update(feats)
         out_row["ast_nodes"] = ast_n
         rows.append(out_row)
+
+    click.echo(f"[02_features] cp_preprocess: stripped {cp_stripped}, dropped {cp_filtered} template-heavy records")
 
     if not rows:
         raise click.ClickException("no rows survived feature extraction")
