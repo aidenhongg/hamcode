@@ -84,6 +84,12 @@ class Config:
     model_name: str = "microsoft/graphcodebert-base"
     data_dir: str = "data/processed"
     output_dir: str = ""
+    # Explicit per-split parquet overrides. Used by OOF driver (stacking/features/oof_point.py)
+    # to point at fold-specific files without mutating data_dir layout. Empty string means
+    # fall back to data_dir/<train|val|test>.parquet (point) or data_dir/pair_<split>.parquet (pair).
+    train_parquet: str = ""
+    val_parquet: str = ""
+    test_parquet: str = ""
     max_seq_len: int = 512
     max_dfg_nodes: int = 64
     batch_size: int = 16
@@ -150,7 +156,9 @@ def resolve_class_weights(cfg: Config) -> torch.Tensor | None:
     if cfg.task != "point" or cfg.class_weights == "none":
         return None
     if cfg.class_weights == "auto":
-        train_pq = Path(cfg.data_dir) / "train.parquet"
+        train_pq = Path(cfg.train_parquet) if cfg.train_parquet else (
+            Path(cfg.data_dir) / "train.parquet"
+        )
         w = compute_class_weights(train_pq)
         print(f"[train] class weights (auto, inv-sqrt-freq): {[round(x, 3) for x in w]}")
         return torch.tensor(w, dtype=torch.float)
@@ -232,6 +240,12 @@ def main() -> int:
     ap.add_argument("--model_name", default=None)
     ap.add_argument("--data_dir", default=None)
     ap.add_argument("--output_dir", default=None)
+    ap.add_argument("--train_parquet", default=None,
+                    help="Override train split path (used by OOF driver).")
+    ap.add_argument("--val_parquet", default=None,
+                    help="Override val split path (used by OOF driver).")
+    ap.add_argument("--test_parquet", default=None,
+                    help="Override test split path (used by OOF driver).")
     ap.add_argument("--max_seq_len", type=int, default=None)
     ap.add_argument("--max_dfg_nodes", type=int, default=None)
     ap.add_argument("--batch_size", type=int, default=None)
@@ -287,15 +301,16 @@ def main() -> int:
     logger.info("tokenizer ready (vocab=%d)", tokenizer.vocab_size)
 
     if cfg.task == "point":
-        train_path = data_root / "train.parquet"
-        val_path = data_root / "val.parquet"
-        test_path = data_root / "test.parquet"
+        train_path = Path(cfg.train_parquet) if cfg.train_parquet else data_root / "train.parquet"
+        val_path = Path(cfg.val_parquet) if cfg.val_parquet else data_root / "val.parquet"
+        test_path = Path(cfg.test_parquet) if cfg.test_parquet else data_root / "test.parquet"
         DS = PointDataset
     else:
-        train_path = data_root / "pair_train.parquet"
-        val_path = data_root / "pair_val.parquet"
-        test_path = data_root / "pair_test.parquet"
+        train_path = Path(cfg.train_parquet) if cfg.train_parquet else data_root / "pair_train.parquet"
+        val_path = Path(cfg.val_parquet) if cfg.val_parquet else data_root / "pair_val.parquet"
+        test_path = Path(cfg.test_parquet) if cfg.test_parquet else data_root / "pair_test.parquet"
         DS = PairDataset
+    logger.info("data paths: train=%s val=%s test=%s", train_path, val_path, test_path)
 
     logger.info("loading datasets from %s ...", data_root)
     ds_kwargs = dict(
