@@ -35,7 +35,7 @@ import torch.nn as nn
 import yaml
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
@@ -108,6 +108,7 @@ class Config:
     prefetch_factor: int = 4
     cache_dir: str = ""
     use_dfg: bool = False   # DEFAULT: simple tokenization, no DFG. Set True for paper-faithful.
+    balanced_sampler: bool = True   # WeightedRandomSampler on train for point-mode
 
 
 def load_config(cli: argparse.Namespace) -> Config:
@@ -262,6 +263,10 @@ def main() -> int:
                     help="Paper-faithful mode: tree-sitter DFG + 2D graph attention mask")
     ap.add_argument("--no_dfg", dest="use_dfg", action="store_false",
                     help="Simple mode (default): standard 1D tokenization, no DFG")
+    ap.add_argument("--balanced_sampler", action="store_true", default=None,
+                    help="WeightedRandomSampler on train set (point only; default on)")
+    ap.add_argument("--no_balanced_sampler", dest="balanced_sampler", action="store_false",
+                    help="Plain shuffled sampler; rely only on loss class weights")
     args = ap.parse_args()
 
     cfg = load_config(args)
@@ -325,12 +330,36 @@ def main() -> int:
         persistent_workers=cfg.num_workers > 0,
         prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
     )
-    dl_train = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, **dl_kwargs)
+
+    # Balanced sampling: inverse-frequency over-sampling so every batch is ~class-balanced.
+    # Complementary to class_weights in loss (both can be on). Only wire for --point;
+    # pairwise labels (A_faster/same/B_faster) are usually close-to-balanced by construction.
+    train_sampler = None
+    train_shuffle = True
+    if cfg.task == "point" and cfg.balanced_sampler:
+        import pyarrow.parquet as _pq
+        labels_raw = _pq.read_table(train_path).column("label").to_pylist()
+        from common.labels import LABEL_TO_IDX
+        counts: dict[int, int] = {}
+        for lab in labels_raw:
+            i = LABEL_TO_IDX[lab]; counts[i] = counts.get(i, 0) + 1
+        per_class_weight = {i: 1.0 / max(1, counts.get(i, 1)) for i in counts}
+        sample_weights = [per_class_weight[LABEL_TO_IDX[l]] for l in labels_raw]
+        train_sampler = WeightedRandomSampler(
+            sample_weights, num_samples=len(sample_weights), replacement=True,
+        )
+        train_shuffle = False
+        logger.info("balanced sampler: per-class counts %s", dict(sorted(counts.items())))
+
+    dl_train = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=train_shuffle,
+                          sampler=train_sampler, **dl_kwargs)
     dl_val = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False, **dl_kwargs)
     dl_test = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False, **dl_kwargs)
-    logger.info("DataLoader: bs=%d num_workers=%d prefetch_factor=%d pin_memory=%s",
+    logger.info("DataLoader: bs=%d num_workers=%d prefetch_factor=%d pin_memory=%s "
+                "balanced_sampler=%s",
                 cfg.batch_size, cfg.num_workers, cfg.prefetch_factor,
-                device.type == "cuda")
+                device.type == "cuda",
+                train_sampler is not None)
 
     # --- model -----
     logger.info("building model (%s, task=%s) ...", cfg.model_name, cfg.task)

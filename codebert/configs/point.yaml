@@ -14,7 +14,8 @@ weight_decay: 0.01
 epochs: 8
 label_smoothing: 0.0
 bf16: true
-class_weights: auto   # auto | none | PATH to json of floats (11 values)
+class_weights: auto        # auto | none | PATH to json of floats (11 values)
+balanced_sampler: true     # WeightedRandomSampler on train; every batch ~class-balanced
 
 # Eval / checkpointing
 eval_every_steps: 200
