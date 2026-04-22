@@ -1,8 +1,15 @@
 # Core ML stack (RTX 5090 / Blackwell sm_120 needs CUDA 12.8+)
 # On RunPod, pick nvidia/cuda:12.8.0-cudnn-devel-ubuntu22.04 base image.
-# Install torch with the cu128 index:
-#   pip install --index-url https://download.pytorch.org/whl/cu128 torch==2.6.0
-torch>=2.6.0
+# Install torch with the cu128 index (no version pin — the index publishes
+# 2.7.0+cu128 through 2.11.0+cu128 as of this writing, any is fine):
+#   pip install --index-url https://download.pytorch.org/whl/cu128 torch
+#
+# If the base image already ships torchvision/torchaudio, they almost
+# certainly won't match the cu128 torch you install on top. We never use
+# either — uninstall them to avoid transformers' lazy-vision import
+# exploding (operator torchvision::nms does not exist):
+#   pip uninstall -y torchvision torchaudio
+torch>=2.7.0
 transformers>=4.45.0
 accelerate>=1.0.0
 datasets>=2.20.0

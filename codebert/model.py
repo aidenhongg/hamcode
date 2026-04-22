@@ -37,7 +37,11 @@ class GraphCodeBERTClassifier(nn.Module):
         assert task in ("point", "pair"), task
         self.task = task
         self.num_labels = NUM_POINT_LABELS if task == "point" else NUM_PAIR_LABELS
-        self.encoder = AutoModel.from_pretrained(model_name)
+        # use_safetensors=False avoids HF's auto-discovery of safetensors
+        # converted on PR branches (refs/pr/N) — that lookup hangs on flaky
+        # LFS redirects for models like microsoft/graphcodebert-base whose
+        # main branch only ships pytorch_model.bin.
+        self.encoder = AutoModel.from_pretrained(model_name, use_safetensors=False)
         hidden = self.encoder.config.hidden_size
         self.dropout = nn.Dropout(dropout)
         self.classifier = nn.Linear(hidden, self.num_labels)

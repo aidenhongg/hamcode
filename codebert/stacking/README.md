@@ -46,10 +46,19 @@ results should be treated as upper-bound train metrics only.
 
 ```bash
 pip install -r requirements.txt
-# Torch wheels with CUDA 12.8 come from a non-default index:
-pip install --index-url https://download.pytorch.org/whl/cu128 torch==2.6.0
+# Torch wheels with CUDA 12.8 come from a non-default index. No pin — any of
+# the 2.7.0+cu128 / 2.8 / 2.9 / 2.10 / 2.11 wheels work.
+pip install --index-url https://download.pytorch.org/whl/cu128 torch
+# If the base image ships torchvision/torchaudio, uninstall them — they'll
+# almost certainly be ABI-incompatible with the cu128 torch wheel and make
+# transformers crash on first model load ("operator torchvision::nms does
+# not exist"). We don't use vision anywhere.
+pip uninstall -y torchvision torchaudio
 pip install -r requirements-stacking.txt    # xgboost, lightgbm, radon, joblib
 ```
+
+`stacking/scripts/run_runpod.sh` runs this `uninstall` step defensively
+every time, so you can skip it here if you prefer one-shot execution.
 
 ## One-shot pipeline
 

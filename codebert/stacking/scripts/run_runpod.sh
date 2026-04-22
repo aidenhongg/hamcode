@@ -55,8 +55,22 @@ done
 
 mkdir -p "$EXTRACTION_DIR" "$OUT_ROOT"
 
+echo "=== [0/6] Environment sanity ==="
+# torchvision / torchaudio preinstalled on the base image nearly always mismatch
+# the cu128 torch we install on top, causing transformers' lazy-vision import
+# to crash with "operator torchvision::nms does not exist". We never use them —
+# remove them so transformers' optional-dep probe gracefully skips vision.
+if python -c "import torchvision" 2>/dev/null; then
+    echo "  purging torchvision/torchaudio (not used; avoids ABI mismatch with cu128 torch)"
+    pip uninstall -y torchvision torchaudio >/dev/null 2>&1 || true
+fi
+
 echo "=== [1/6] GPU check ==="
-python -c "import torch; assert torch.cuda.is_available(), 'no CUDA'; print('GPU:', torch.cuda.get_device_name(0), 'bf16:', torch.cuda.is_bf16_supported())"
+python -c "import torch; assert torch.cuda.is_available(), 'no CUDA'; print('GPU:', torch.cuda.get_device_name(0), 'torch:', torch.__version__, 'bf16:', torch.cuda.is_bf16_supported())"
+# Fail fast if transformers can't import RobertaModel — this catches the
+# torch/torchvision ABI mismatch even when the import happened deep inside
+# subprocess-spawned train.py, where the traceback is harder to read.
+python -c "from transformers import AutoModel; AutoModel.from_pretrained('microsoft/graphcodebert-base'); print('transformers + encoder load OK')" 2>&1 | tail -5
 
 if [ "$SKIP_DATA" -eq 0 ]; then
     echo "=== [2/6] Building dataset ==="
