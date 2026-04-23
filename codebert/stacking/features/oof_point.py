@@ -295,12 +295,12 @@ def main() -> int:
     ap.add_argument("--n_folds", type=int, default=5)
     ap.add_argument("--seed", type=int, default=42)
 
-    # Training hyperparams (passed to train.py). Tight cap — OOF folds only
-    # need enough epochs to produce sensible held-out predictions, not a
-    # converged model. Patience (default 2) typically stops folds earlier.
-    ap.add_argument("--epochs", type=int, default=8,
-                    help="Hard upper bound per fold. 8 is sufficient given "
-                         "warm-start from graphcodebert-base + patience.")
+    # Training hyperparams (passed to train.py). Generous upper bound; patience
+    # is the real stopper. Earlier 8-epoch cap clearly under-trained the pair
+    # model (see SUMMARY.md: v2 underperformed v1), so we loosen both.
+    ap.add_argument("--epochs", type=int, default=40,
+                    help="Hard upper bound per fold. Patience typically stops "
+                         "training at ~15-20 epochs on the full train set.")
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--grad_accum", type=int, default=2)
     ap.add_argument("--lr", type=float, default=2e-5)
@@ -309,7 +309,7 @@ def main() -> int:
     ap.add_argument("--num_workers", type=int, default=4)
     ap.add_argument("--max_seq_len", type=int, default=512)
     ap.add_argument("--eval_every_steps", type=int, default=100)
-    ap.add_argument("--patience", type=int, default=2,
+    ap.add_argument("--patience", type=int, default=3,
                     help="Stop after this many consecutive evals with no improvement.")
 
     # Extraction hyperparams

@@ -90,13 +90,28 @@ and never calls home.
 bash stacking/scripts/run_runpod.sh
 ```
 
+Runs end-to-end: data → AST → OOF pointwise → semantic → OOF pairwise →
+grid sweep (72 configs) → HP search on top heads (Optuna, 40 trials each).
+
 Flags (all optional):
 - `--skip-data` — dataset already built
 - `--skip-oof-point` — OOF pointwise extraction already done
 - `--skip-oof-pair` — accept pair leakage (cuts ~2.5 GPU-hours)
+- `--skip-sweep` — skip the 72-config grid (go straight to HP search)
+- `--skip-hp` — skip Optuna HP search
+- `--hp-trials N` — Optuna trials per (head, variant) cell (default 40)
+- `--hp-heads` — csv, default `xgb,lgbm,mlp,stacked`
+- `--hp-variants` — csv, default `v1,v3` (v2 consistently loses on this task)
 - `--n_folds N` — number of OOF folds (default 5)
 
-Expected wallclock on 5090: ~3.5 hours end-to-end.
+Expected wallclock on 5090 (post epoch-bump + HP search):
+- OOF pointwise (40-epoch cap, 6 runs): ~2 h
+- OOF pairwise (30-epoch cap, 6 runs): ~4 h
+- Grid sweep (72 head configs): ~10 min CPU
+- HP search (4 heads x 2 variants x 40 trials): ~2-4 h CPU
+- Total: ~8-10 h
+
+The grid sweep and HP search run on CPU so they don't contend with the BERT extraction.
 
 ## Manual pipeline (same steps)
 
@@ -135,13 +150,46 @@ python -m stacking.features.oof_pair \
     --warm_start_from runs/heads/extraction/oof/full/best \
     --extract_batch 32 --resume
 
-# 6. Head sweep (72 experiments, ~10 min CPU)
+# 6. Grid sweep — fixed HPs, 8 heads x 3 variants x 3 seeds = 72 configs (~10 min CPU)
 python -m stacking.sweep \
     --config stacking/configs/sweep.yaml \
     --in_splits data/processed \
     --extraction_dir runs/heads/extraction \
     --out_dir runs/heads
+
+# 7. HP search — Optuna TPE on top heads (XGB/LGBM/MLP/Stacked), best seed-avg on test
+python -m stacking.hp_search \
+    --heads xgb,lgbm,mlp,stacked \
+    --variants v1,v3 \
+    --trials 40 --seeds 42,43,44 \
+    --in_splits data/processed \
+    --extraction_dir runs/heads/extraction \
+    --out_root runs/heads/hp
 ```
+
+## Grid sweep vs HP search
+
+The pipeline runs both by design:
+
+**Grid sweep** (`stacking.sweep`): fixed HPs across 8 heads x 3 variants x 3 seeds.
+Cheap comparison of heads *under the same defaults*. Tells you which head
+architecture responds best to these features out of the box.
+
+**HP search** (`stacking.hp_search`): Optuna TPE, per (head, variant). Rich search
+spaces — XGBoost over depth/lr/n_estimators/regularization, LightGBM similar,
+MLP over hidden_layers/hidden_dim/activation/optimizer/dropout/layer_norm,
+Stacked over base-head subset and meta choice. Pruned with MedianPruner.
+Winning HPs are re-run at 3 seeds on TEST for variance bars.
+
+Read the grid sweep first (`runs/heads/SUMMARY.md`) for head ranking; read
+the HP search (`runs/heads/hp/HP_SUMMARY.md`) for the final best numbers.
+
+Artifacts per HP cell (`runs/heads/hp/<head>-<variant>/`):
+- `study.db` — SQLite Optuna storage (resumable across runs)
+- `best_params.json` — winning HPs + best val macro-F1
+- `trials.jsonl` — every trial's params + val metrics
+- `seed_results.jsonl` — final test eval at each seed
+- `summary.json` — headline numbers (test acc mean ± std, etc.)
 
 ## Resumability
 

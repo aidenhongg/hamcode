@@ -1,8 +1,26 @@
-"""MLP head. 2 hidden layers + dropout. CPU-friendly; also works on CUDA."""
+"""MLP head. Configurable depth/width/activation/optimizer for HP search.
+
+Architecture sketch:
+    input -> [Linear(in, h) -> Act -> (LayerNorm?) -> Dropout] x L -> Linear(h, 2)
+
+Variable knobs:
+    hidden_layers   : number of hidden blocks L  (1..5 typical)
+    hidden_dim      : width of each hidden layer (64..512 typical)
+    activation      : 'relu' | 'gelu' | 'silu'
+    dropout         : 0.0..0.5
+    layer_norm      : bool — add LayerNorm before dropout in each block
+    optimizer       : 'adam' | 'adamw'
+    lr / weight_decay: standard
+    epochs / batch_size / patience: training control
+
+Fits on CPU or CUDA. For the head sweep we keep it on CPU (fast enough at
+~20K rows and <300 feature dims); if you want GPU pass device="cuda".
+"""
 
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Iterable
 
 import joblib
 import numpy as np
@@ -12,14 +30,45 @@ import torch.nn as nn
 from .base import HeadRegistry
 
 
-class _MLP(nn.Module):
-    def __init__(self, input_dim: int, hidden: int = 128, dropout: float = 0.3) -> None:
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(hidden, hidden), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(hidden, 2),
+_ACTIVATIONS = {
+    "relu": nn.ReLU,
+    "gelu": nn.GELU,
+    "silu": nn.SiLU,
+}
+
+
+def _widen_activation(name: str) -> type[nn.Module]:
+    if name not in _ACTIVATIONS:
+        raise ValueError(
+            f"unknown activation {name!r}; expected one of {list(_ACTIVATIONS)}"
         )
+    return _ACTIVATIONS[name]
+
+
+class _MLP(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_layers: int = 2,
+        hidden_dim: int = 128,
+        activation: str = "relu",
+        dropout: float = 0.3,
+        layer_norm: bool = False,
+    ) -> None:
+        super().__init__()
+        act_cls = _widen_activation(activation)
+        layers: list[nn.Module] = []
+        prev = input_dim
+        for _ in range(hidden_layers):
+            layers.append(nn.Linear(prev, hidden_dim))
+            layers.append(act_cls())
+            if layer_norm:
+                layers.append(nn.LayerNorm(hidden_dim))
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            prev = hidden_dim
+        layers.append(nn.Linear(prev, 2))
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x):
         return self.net(x)
@@ -30,19 +79,34 @@ class MLPHead:
     def __init__(
         self,
         seed: int = 42,
-        hidden: int = 128,
+        hidden_layers: int = 2,
+        hidden_dim: int = 128,
+        activation: str = "relu",
         dropout: float = 0.3,
+        layer_norm: bool = False,
+        optimizer: str = "adamw",
         lr: float = 1e-3,
         weight_decay: float = 1e-4,
-        epochs: int = 8,            # tight cap — head sweep budget
+        epochs: int = 40,            # with patience=5, typical stop at ~10-15
         batch_size: int = 256,
-        patience: int = 3,
+        patience: int = 5,
+        grad_clip: float = 1.0,
         device: str | None = None,
     ) -> None:
         self.hp = dict(
-            seed=seed, hidden=hidden, dropout=dropout, lr=lr,
-            weight_decay=weight_decay, epochs=epochs, batch_size=batch_size,
+            seed=seed,
+            hidden_layers=hidden_layers,
+            hidden_dim=hidden_dim,
+            activation=activation,
+            dropout=dropout,
+            layer_norm=layer_norm,
+            optimizer=optimizer,
+            lr=lr,
+            weight_decay=weight_decay,
+            epochs=epochs,
+            batch_size=batch_size,
             patience=patience,
+            grad_clip=grad_clip,
         )
         self.device = torch.device(device) if device else torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
@@ -50,21 +114,36 @@ class MLPHead:
         self._input_dim: int | None = None
         self.model: _MLP | None = None
 
+    def _make_optimizer(self, params: Iterable[nn.Parameter]) -> torch.optim.Optimizer:
+        name = self.hp["optimizer"].lower()
+        lr = self.hp["lr"]
+        wd = self.hp["weight_decay"]
+        if name == "adam":
+            return torch.optim.Adam(params, lr=lr, weight_decay=wd)
+        if name == "adamw":
+            return torch.optim.AdamW(params, lr=lr, weight_decay=wd)
+        raise ValueError(f"unknown optimizer {name!r}; expected adam or adamw")
+
     def fit(self, X_train, y_train, X_val=None, y_val=None, class_weight=None):
         seed = self.hp["seed"]
         torch.manual_seed(seed); np.random.seed(seed)
 
         self._input_dim = int(X_train.shape[1])
-        self.model = _MLP(self._input_dim, self.hp["hidden"], self.hp["dropout"]).to(self.device)
+        self.model = _MLP(
+            self._input_dim,
+            hidden_layers=self.hp["hidden_layers"],
+            hidden_dim=self.hp["hidden_dim"],
+            activation=self.hp["activation"],
+            dropout=self.hp["dropout"],
+            layer_norm=self.hp["layer_norm"],
+        ).to(self.device)
 
         class_w = torch.ones(2, dtype=torch.float32, device=self.device)
         if class_weight is not None:
             class_w = torch.tensor([class_weight[0], class_weight[1]],
                                     dtype=torch.float32, device=self.device)
         loss_fn = nn.CrossEntropyLoss(weight=class_w)
-        opt = torch.optim.AdamW(self.model.parameters(),
-                                 lr=self.hp["lr"],
-                                 weight_decay=self.hp["weight_decay"])
+        opt = self._make_optimizer(self.model.parameters())
 
         Xt = torch.from_numpy(X_train.astype(np.float32))
         yt = torch.from_numpy(y_train.astype(np.int64))
@@ -93,7 +172,10 @@ class MLPHead:
                 loss = loss_fn(logits, yb)
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                if self.hp["grad_clip"] > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), self.hp["grad_clip"],
+                    )
                 opt.step()
                 epoch_loss += float(loss.item()) * xb.shape[0]
             epoch_loss /= max(1, n)
@@ -149,12 +231,19 @@ class MLPHead:
         meta = joblib.load(out_dir / "mlp_meta.pkl")
         inst = cls(**meta["hp"])
         inst._input_dim = meta["input_dim"]
-        inst.model = _MLP(inst._input_dim, inst.hp["hidden"], inst.hp["dropout"])
+        inst.model = _MLP(
+            inst._input_dim,
+            hidden_layers=inst.hp["hidden_layers"],
+            hidden_dim=inst.hp["hidden_dim"],
+            activation=inst.hp["activation"],
+            dropout=inst.hp["dropout"],
+            layer_norm=inst.hp["layer_norm"],
+        )
         inst.model.load_state_dict(torch.load(out_dir / "mlp.pt", map_location="cpu"))
         inst.model.to(inst.device).eval()
         return inst
 
     def feature_importance(self) -> dict[str, float] | None:
-        # For MLPs, permutation importance is more principled but slow. Skip here;
-        # leave it to sweep to optionally compute on the winning head.
+        # For MLPs, permutation importance is more principled but slow.
+        # Left for a separate post-hoc explain step on the winning head.
         return None

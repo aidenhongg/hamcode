@@ -244,12 +244,13 @@ def main() -> int:
     ap.add_argument("--n_folds", type=int, default=5)
     ap.add_argument("--seed", type=int, default=42)
 
-    # Training hyperparams (passed to train.py). Tight cap — OOF folds only
-    # need enough epochs for sensible held-out predictions. Patience stops
-    # folds that have already converged.
-    ap.add_argument("--epochs", type=int, default=8,
-                    help="Hard upper bound per fold. 8 epochs on 20K+ pairs "
-                         "with warm-start is enough for useful signal.")
+    # Training hyperparams (passed to train.py). Generous cap; patience stops
+    # converged folds. The earlier 8-epoch cap visibly under-trained the pair
+    # model — v2 (pair-only) underperformed v1 (pointwise-only) in the sweep,
+    # which is a signature of undertrained pair logits, not saturation.
+    ap.add_argument("--epochs", type=int, default=30,
+                    help="Hard upper bound per fold. Patience typically stops "
+                         "training at ~10-15 epochs per fold.")
     ap.add_argument("--batch_size", type=int, default=12)
     ap.add_argument("--grad_accum", type=int, default=2)
     ap.add_argument("--lr", type=float, default=1e-5)
@@ -260,7 +261,7 @@ def main() -> int:
     ap.add_argument("--num_workers", type=int, default=4)
     ap.add_argument("--max_seq_len", type=int, default=512)
     ap.add_argument("--eval_every_steps", type=int, default=100)
-    ap.add_argument("--patience", type=int, default=2,
+    ap.add_argument("--patience", type=int, default=3,
                     help="Stop after this many consecutive evals with no improvement.")
     ap.add_argument("--warm_start_from", default="",
                     help="Pass path to an OOF pointwise final checkpoint (recommended). "

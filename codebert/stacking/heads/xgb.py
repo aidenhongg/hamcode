@@ -21,13 +21,18 @@ class XGBHead:
         n_estimators: int = 400,
         subsample: float = 0.85,
         colsample_bytree: float = 0.85,
+        min_child_weight: float = 1.0,
+        gamma: float = 0.0,
+        reg_alpha: float = 0.0,
         reg_lambda: float = 1.0,
         early_stopping_rounds: int = 50,
     ) -> None:
         self.hp = dict(
             seed=seed, max_depth=max_depth, learning_rate=learning_rate,
             n_estimators=n_estimators, subsample=subsample,
-            colsample_bytree=colsample_bytree, reg_lambda=reg_lambda,
+            colsample_bytree=colsample_bytree,
+            min_child_weight=min_child_weight, gamma=gamma,
+            reg_alpha=reg_alpha, reg_lambda=reg_lambda,
             early_stopping_rounds=early_stopping_rounds,
         )
         self.model = None   # constructed at fit time so we can toggle early stopping
@@ -44,6 +49,9 @@ class XGBHead:
             n_estimators=self.hp["n_estimators"],
             subsample=self.hp["subsample"],
             colsample_bytree=self.hp["colsample_bytree"],
+            min_child_weight=self.hp["min_child_weight"],
+            gamma=self.hp["gamma"],
+            reg_alpha=self.hp["reg_alpha"],
             reg_lambda=self.hp["reg_lambda"],
             random_state=self.hp["seed"],
             n_jobs=1,               # deterministic for reproducibility
