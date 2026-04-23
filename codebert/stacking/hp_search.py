@@ -93,8 +93,8 @@ def _space_lgbm(trial: "optuna.Trial", seed: int) -> dict:
     )
 
 
-def _space_mlp(trial: "optuna.Trial", seed: int) -> dict:
-    return dict(
+def _space_mlp(trial: "optuna.Trial", seed: int, device: str | None = None) -> dict:
+    hp = dict(
         seed=seed,
         hidden_layers=trial.suggest_int("hidden_layers", 1, 4),
         hidden_dim=trial.suggest_categorical("hidden_dim", [64, 128, 192, 256, 384, 512]),
@@ -108,8 +108,10 @@ def _space_mlp(trial: "optuna.Trial", seed: int) -> dict:
         epochs=40,
         patience=5,
         grad_clip=1.0,
-        device="cpu",           # keep head sweep CPU-local; deterministic
     )
+    if device is not None:
+        hp["device"] = device   # only pin if caller explicitly requested
+    return hp
 
 
 def _space_stacked(trial: "optuna.Trial", seed: int) -> dict:
@@ -138,12 +140,21 @@ def _space_stacked(trial: "optuna.Trial", seed: int) -> dict:
     )
 
 
-_SPACES: dict[str, Callable[["optuna.Trial", int], dict]] = {
+# Spaces take (trial, seed) by default; _space_mlp accepts an optional device
+# kwarg. _dispatch_space normalises the call so the outer loop doesn't care.
+_SPACES: dict[str, Callable[..., dict]] = {
     "xgb": _space_xgb,
     "lgbm": _space_lgbm,
     "mlp": _space_mlp,
     "stacked": _space_stacked,
 }
+
+
+def _dispatch_space(head_name: str, trial, seed: int, mlp_device: str | None):
+    fn = _SPACES[head_name]
+    if head_name == "mlp":
+        return fn(trial, seed, device=mlp_device)
+    return fn(trial, seed)
 
 
 # -----------------------------------------------------------------------------
@@ -173,6 +184,7 @@ def run_hp_search(
     out_dir: Path,
     class_weight_mode: str = "auto",
     timeout_seconds: int | None = None,
+    mlp_device: str | None = None,
 ) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     # Build features once — feature matrix + scaler are identical across trials.
@@ -182,12 +194,10 @@ def run_hp_search(
     )
     cw = compute_class_weight(train.y) if class_weight_mode == "auto" else None
 
-    space = _SPACES[head_name]
-
     trials_log = (out_dir / "trials.jsonl").open("a", encoding="utf-8")
 
     def objective(trial: "optuna.Trial") -> float:
-        hp = space(trial, seed=search_seed)
+        hp = _dispatch_space(head_name, trial, seed=search_seed, mlp_device=mlp_device)
         try:
             val_met, _test_met, _ = _fit_and_score(
                 head_name, hp, train, val, test, class_weight=cw,
@@ -243,7 +253,8 @@ def run_hp_search(
     seed_results: list[dict] = []
     for s in seeds:
         # Re-construct the HP dict with this seed substituted.
-        hp = {**space_hp_from_best(head_name, best_params, seed=s)}
+        hp = {**space_hp_from_best(head_name, best_params, seed=s,
+                                      mlp_device=mlp_device)}
         try:
             val_met, test_met, head = _fit_and_score(
                 head_name, hp, train, val, test, class_weight=cw,
@@ -293,22 +304,30 @@ def run_hp_search(
     return summary
 
 
-def space_hp_from_best(head_name: str, best_params: dict, seed: int) -> dict:
+def space_hp_from_best(
+    head_name: str, best_params: dict, seed: int,
+    mlp_device: str | None = None,
+) -> dict:
     """Rebuild a fit-ready HP dict from Optuna best_params + a chosen seed.
 
     Optuna's best_params is the raw suggest output (str/float/int). Most
     map 1:1 to head constructor args. Special cases:
-      - MLP: add the non-searched fixed fields (epochs/patience/grad_clip/device)
+      - MLP: add the non-searched fixed fields (epochs/patience/grad_clip).
+             Device is left to MLPHead's default (CUDA if available, else CPU)
+             unless the caller passes an explicit override.
       - Stacked: expand use_<name> flags back into a bases list
     """
     if head_name in ("xgb", "lgbm"):
         return {**best_params, "seed": seed}
     if head_name == "mlp":
-        return {
+        hp = {
             **best_params,
             "seed": seed,
-            "epochs": 40, "patience": 5, "grad_clip": 1.0, "device": "cpu",
+            "epochs": 40, "patience": 5, "grad_clip": 1.0,
         }
+        if mlp_device is not None:
+            hp["device"] = mlp_device
+        return hp
     if head_name == "stacked":
         candidates = ["xgb", "lgbm", "mlp", "logreg", "rf"]
         bases = [n for n in candidates if best_params.get(f"use_{n}", False)]
@@ -404,6 +423,9 @@ def main() -> int:
     ap.add_argument("--extraction_dir", default="runs/heads/extraction")
     ap.add_argument("--out_root", default="runs/heads/hp")
     ap.add_argument("--class_weight", default="auto", choices=["auto", "none"])
+    ap.add_argument("--mlp_device", default=None,
+                    help="Force MLP training device ('cpu', 'cuda', 'cuda:0'). "
+                         "Default: MLPHead auto-picks CUDA if available.")
     args = ap.parse_args()
 
     heads = _parse_list(args.heads)
@@ -432,6 +454,7 @@ def main() -> int:
                     out_dir=cell_dir,
                     class_weight_mode=args.class_weight,
                     timeout_seconds=args.timeout_seconds or None,
+                    mlp_device=args.mlp_device,
                 )
             except Exception as e:
                 print(f"[hp] FAILED {h}/{v}: {e}", flush=True)
