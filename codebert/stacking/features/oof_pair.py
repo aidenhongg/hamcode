@@ -64,66 +64,38 @@ from stacking.features.bert_logits import (
 
 
 # -----------------------------------------------------------------------------
-# Fold assignment — problem-disjoint across folds
+# Fold assignment — pair-id-disjoint across folds
+#
+# The earlier revision tried union-find over code SHAs to enforce "no code
+# appears in both fold_k train and fold_k heldout". That over-fires on this
+# corpus: every code participates in many pairs (cross-problem sampling is
+# dense), so transitivity collapses the shared-code graph into one giant
+# component and every pair lands in a single fold — fold_00 train becomes
+# empty and training crashes with num_samples=0.
+#
+# The actual guarantee OOF needs is that the *specific pair* (A, B) used
+# at eval time was not seen by the model that produced those predictions.
+# Pair-id-level disjointness is sufficient. Upstream (pipeline/08_split.py)
+# already enforces problem-id isolation between train/val/test, so codes
+# themselves are well distributed — the remaining OOF concern is only the
+# pair-interaction signal.
 # -----------------------------------------------------------------------------
 
-def _pid_pair_key(row: dict) -> tuple[str, str]:
-    # Sort problem ids to make the key canonical (A,B and B,A fall in the same fold)
-    pa_pid = str(row.get("label_a") or "") + "|"  # pid not stored on pair directly
-    # Pair parquet carries only code, label, ternary etc. — we don't have problem_id
-    # at pair level. Fall back to code SHAs for disjoint grouping.
-    return ("", "")
-
-
-def _pair_key(code_a: str, code_b: str) -> tuple[str, str]:
-    import hashlib
-    sa = hashlib.sha256(code_a.encode("utf-8")).hexdigest()
-    sb = hashlib.sha256(code_b.encode("utf-8")).hexdigest()
-    return tuple(sorted((sa, sb)))
-
-
 def assign_folds(pair_train: Path, n_folds: int, seed: int) -> dict[str, int]:
-    """Return {pair_id: fold_idx}. Pairs grouped by joint code SHAs."""
+    """Return {pair_id: fold_idx}.
+
+    Assigns pair_ids to folds via a shuffled round-robin. Every fold gets
+    approximately len(pairs)/n_folds examples, and train / heldout never
+    share a pair_id. Codes *may* appear on both sides of a fold boundary,
+    but that is an acceptable loss given the upstream problem-disjoint
+    split and the alternative (union-find collapse) makes folds unusable.
+    """
     tbl = pq.read_table(pair_train)
     pair_ids = tbl.column("pair_id").to_pylist()
-    code_a = tbl.column("code_a").to_pylist()
-    code_b = tbl.column("code_b").to_pylist()
-
-    # Build a union-find over code SHAs so any two pairs sharing ANY code SHA
-    # on either side end up in the same fold (no cross-fold code reuse).
-    import hashlib
-    parent: dict[str, str] = {}
-    def find(x):
-        while parent.setdefault(x, x) != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-    def union(a, b):
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[ra] = rb
-
-    shas_a = [hashlib.sha256(c.encode("utf-8")).hexdigest() for c in code_a]
-    shas_b = [hashlib.sha256(c.encode("utf-8")).hexdigest() for c in code_b]
-    for sa, sb in zip(shas_a, shas_b):
-        union(sa, sb)
-
-    # Each connected component is a fold-atomic unit.
-    component: dict[str, str] = {}
-    for sa, sb in zip(shas_a, shas_b):
-        ra = find(sa)
-        component[sa] = ra
-        component[sb] = ra
-
-    comps = sorted({find(s) for s in component})
     rng = np.random.default_rng(seed)
-    rng.shuffle(comps)
-    comp_to_fold = {c: i % n_folds for i, c in enumerate(comps)}
-
-    out: dict[str, int] = {}
-    for pid, sa, sb in zip(pair_ids, shas_a, shas_b):
-        out[pid] = comp_to_fold[find(sa)]
-    return out
+    shuffled = list(pair_ids)
+    rng.shuffle(shuffled)
+    return {pid: i % n_folds for i, pid in enumerate(shuffled)}
 
 
 def split_pair_parquet(

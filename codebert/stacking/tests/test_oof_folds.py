@@ -163,55 +163,57 @@ def _mk_pair_parquet(rows: list[dict], tmp: Path) -> Path:
     return p
 
 
-def test_pair_folds_no_shared_code_across_fold_train_sets():
-    """Any two pairs that share a code (on either side) must land in the same fold."""
-    import hashlib
-    rows = []
-    # 20 distinct codes. We construct pairs so some share code across groups.
-    codes = [f"def f_{i}(): return {i}" for i in range(20)]
+def test_pair_folds_are_balanced_and_pair_id_disjoint():
+    """Every pair has exactly one fold, and counts are approximately balanced.
 
-    # Pair 0: code 0 + code 1  (group A)
-    # Pair 1: code 1 + code 2  (group A — shares code 1 with pair 0)
-    # Pair 2: code 2 + code 3  (group A — shares code 2 with pair 1)
-    # Pair 3: code 4 + code 5  (group B — disjoint from A)
-    # Pair 4: code 6 + code 7  (group C)
-    # ...
-    pair_specs = [
-        (0, 1), (1, 2), (2, 3),   # component A
-        (4, 5),                    # component B
-        (6, 7), (7, 8),            # component C
-        (10, 11),                  # component D
-        (12, 13), (13, 14),        # component E
-        (15, 16),                  # component F
-    ]
-    for i, (a, b) in enumerate(pair_specs):
-        rows.append({
+    NOTE: we no longer require code-level disjointness across fold train/heldout
+    boundaries — the earlier union-find approach collapsed the whole corpus into
+    one giant component (every code appears in many pairs, transitivity eats
+    the graph). Pair-id level disjointness is the contract now.
+    """
+    rows = [
+        {
             "pair_id": f"p{i:04d}",
-            "code_a": codes[a], "code_b": codes[b],
+            "code_a": f"def a_{i}(): pass", "code_b": f"def b_{i}(): pass",
             "label_a": "O(n)", "label_b": "O(n)", "ternary": "same",
             "same_problem": False, "tokens_combined": 1, "split": "train",
-        })
-
+        }
+        for i in range(60)
+    ]
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         pqp = _mk_pair_parquet(rows, tmp)
-        assignment = assign_folds_pair(pqp, n_folds=3, seed=5)
-        # Expected components: {0,1,2,3}, {4,5}, {6,7,8}, {10,11}, {12,13,14}, {15,16}
-        # pairs within the same component must share the same fold.
-        components = [
-            [0, 1, 2],       # pairs p0000..p0002
-            [3],              # p0003
-            [4, 5],           # p0004..p0005
-            [6],              # p0006
-            [7, 8],           # p0007..p0008
-            [9],              # p0009
-        ]
-        for comp in components:
-            fold_set = {assignment[f"p{i:04d}"] for i in comp}
-            assert len(fold_set) == 1, f"component {comp} spans folds {fold_set}"
+        assignment = assign_folds_pair(pqp, n_folds=5, seed=11)
 
-        # Global covering: every pair has an assignment
-        assert len(assignment) == len(rows)
+        # Every input pair gets exactly one fold.
+        assert set(assignment) == {r["pair_id"] for r in rows}
+
+        # Folds are approximately balanced (round-robin over shuffled ids ≈ 12/5 = 12).
+        from collections import Counter
+        counts = Counter(assignment.values())
+        assert set(counts) == {0, 1, 2, 3, 4}
+        smallest, largest = min(counts.values()), max(counts.values())
+        assert largest - smallest <= 1, f"folds imbalanced: {dict(counts)}"
+
+
+def test_pair_fold_assignment_stable_under_seed():
+    rows = [
+        {
+            "pair_id": f"p{i:04d}",
+            "code_a": f"def a_{i}(): pass", "code_b": f"def b_{i}(): pass",
+            "label_a": "O(n)", "label_b": "O(n)", "ternary": "same",
+            "same_problem": False, "tokens_combined": 1, "split": "train",
+        }
+        for i in range(40)
+    ]
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        pqp = _mk_pair_parquet(rows, tmp)
+        a1 = assign_folds_pair(pqp, n_folds=4, seed=7)
+        a2 = assign_folds_pair(pqp, n_folds=4, seed=7)
+        a_other = assign_folds_pair(pqp, n_folds=4, seed=8)
+        assert a1 == a2
+        assert a1 != a_other  # different seed => different shuffle
 
 
 def test_pair_split_parquet_disjoint_between_train_and_heldout():
