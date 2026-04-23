@@ -176,9 +176,19 @@ python -m stacking.features.semantic \
 
 if [ "$SKIP_PAIR" -eq 0 ]; then
     echo "=== [6/6a] OOF pairwise BERT (binary task, 30-epoch cap) ==="
-    # Warm-starts from the OOF full pointwise encoder. Pair head is binary
-    # (0=same, 1=A_faster). Bumped from 8 to 30 epochs — v2 was clearly
-    # undertrained at 8 (v2 < v1 in first-pass sweep). Patience=3 stops early.
+    # Warm-starts from the OOF full pointwise encoder when present. If the
+    # point-OOF was skipped (or its full/ dir was wiped), pair trains fresh
+    # from microsoft/graphcodebert-base — slightly slower convergence but
+    # still correct. Bumped from 8 to 30 epochs (v2 was undertrained at 8).
+    WARM_START_ARGS=()
+    POINT_FULL_CKPT="$EXTRACTION_DIR/oof/full/best/pytorch_model.bin"
+    if [ -f "$POINT_FULL_CKPT" ]; then
+        echo "   warm-starting from OOF point full: $EXTRACTION_DIR/oof/full/best"
+        WARM_START_ARGS=(--warm_start_from "$EXTRACTION_DIR/oof/full/best")
+    else
+        echo "   NOTE: no point-OOF full checkpoint at $POINT_FULL_CKPT"
+        echo "         → pair will train from fresh graphcodebert-base (expect slower convergence)"
+    fi
     python -m stacking.features.oof_pair \
         --data_dir data/processed \
         --out_dir "$EXTRACTION_DIR" \
@@ -195,7 +205,7 @@ if [ "$SKIP_PAIR" -eq 0 ]; then
         --eval_every_steps 100 \
         --patience 3 \
         --extract_batch 32 \
-        --warm_start_from "$EXTRACTION_DIR/oof/full/best" \
+        "${WARM_START_ARGS[@]}" \
         --resume
 else
     echo "=== [6/6a] Skipping OOF pairwise (--skip-oof-pair) ==="
