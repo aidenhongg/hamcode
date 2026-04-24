@@ -21,6 +21,8 @@ wandb/
 *.jsonl
 !tests/fixtures/**/*.parquet
 !tests/fixtures/**/*.jsonl
+runs/
+exports/
 
 .DS_Store
 Thumbs.db
