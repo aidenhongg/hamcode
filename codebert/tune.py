@@ -1,6 +1,6 @@
-"""Hyperparameter search via Optuna.
+"""Hyperparameter search via Optuna for the pointwise classifier.
 
-Each trial spawns a subprocess `python train.py --point ...` with sampled HPs
+Each trial spawns a subprocess `python train.py ...` with sampled HPs
 and parses the final dev macro-F1 out of the run's test_metrics.json. The user
 supplies a separate `--test_metrics_field` if they want to optimize something
 other than `macro_f1`.
@@ -9,7 +9,7 @@ Optuna's sampler persists in a sqlite DB at runs/<study>/optuna.db, so runs
 are resumable across machines.
 
 Example:
-    python tune.py --point --n_trials 12 --study point-tune \\
+    python tune.py --n_trials 12 --study point-tune \\
         --data_dir data/processed --base_output_dir runs/tune/point
 """
 
@@ -29,9 +29,9 @@ except ImportError:
     sys.exit(1)
 
 
-def build_cmd(task: str, data_dir: str, output_dir: str, hp: dict) -> list[str]:
+def build_cmd(data_dir: str, output_dir: str, hp: dict) -> list[str]:
     cmd = [
-        sys.executable, "train.py", f"--{task}",
+        sys.executable, "train.py",
         "--data_dir", data_dir,
         "--output_dir", output_dir,
         "--epochs", str(hp["epochs"]),
@@ -59,7 +59,7 @@ def objective_factory(args):
             "seed": trial.suggest_int("seed", 1, 10_000),
         }
         out_dir = Path(args.base_output_dir) / f"trial-{trial.number:03d}"
-        cmd = build_cmd(args.task, args.data_dir, str(out_dir), hp)
+        cmd = build_cmd(args.data_dir, str(out_dir), hp)
         print(f"[tune] trial {trial.number}: {hp}", flush=True)
         proc = subprocess.run(cmd, capture_output=True, text=True)
         if proc.returncode != 0:
@@ -79,9 +79,6 @@ def objective_factory(args):
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    mode = ap.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--point", dest="task", action="store_const", const="point")
-    mode.add_argument("--pair", dest="task", action="store_const", const="pair")
     ap.add_argument("--n_trials", type=int, default=12)
     ap.add_argument("--max_epochs", type=int, default=6,
                     help="per-trial epoch cap during search (keep small for speed)")
@@ -98,8 +95,6 @@ def main() -> int:
                     help="patience for the final run")
     ap.add_argument("--final_output_dir", default="",
                     help="where to put the final run (default: <base_output_dir>/final)")
-    ap.add_argument("--warm_start_from", default="",
-                    help="pass-through to train.py for --pair warm-start")
     args = ap.parse_args()
 
     base = Path(args.base_output_dir); base.mkdir(parents=True, exist_ok=True)
@@ -138,11 +133,9 @@ def main() -> int:
     final_out = Path(args.final_output_dir or (base / "final"))
     best_hp = dict(best.params)
     best_hp["epochs"] = args.final_epochs     # override search cap with a proper training run
-    final_cmd = build_cmd(args.task, args.data_dir, str(final_out), best_hp) + [
+    final_cmd = build_cmd(args.data_dir, str(final_out), best_hp) + [
         "--patience", str(args.final_patience),
     ]
-    if args.task == "pair" and args.warm_start_from:
-        final_cmd += ["--warm_start_from", args.warm_start_from]
 
     print("\n=== FINAL RUN (best HPs, extended epochs) ===")
     print("cmd:", " ".join(final_cmd), flush=True)

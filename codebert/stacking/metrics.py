@@ -39,42 +39,10 @@ def expected_calibration_error(probs_pos: np.ndarray, y: np.ndarray, n_bins: int
     return float(ece)
 
 
-def mcnemar_p(preds_a: np.ndarray, preds_b: np.ndarray, y: np.ndarray) -> float:
-    """McNemar's test (continuity-corrected) on matched predictions.
-
-    Returns p-value for H0: both classifiers make the same errors.
-    preds_a is the baseline, preds_b is the new model.
-    """
-    from math import exp, lgamma
-
-    a_correct = (preds_a == y)
-    b_correct = (preds_b == y)
-    # b01: a wrong, b right;   b10: a right, b wrong
-    b01 = int(((~a_correct) & b_correct).sum())
-    b10 = int((a_correct & (~b_correct)).sum())
-    n = b01 + b10
-    if n == 0:
-        return 1.0
-    # Exact binomial two-sided under p=0.5
-    k = min(b01, b10)
-    # P(X <= k) with p=0.5, two-sided → 2 * sum_{i<=k} C(n,i) * 0.5^n
-    log_half_n = -n * np.log(2)
-    log_sum = -np.inf
-    for i in range(k + 1):
-        log_cnk = lgamma(n + 1) - lgamma(i + 1) - lgamma(n - i + 1)
-        log_term = log_cnk + log_half_n
-        # log-sum-exp
-        m = max(log_sum, log_term)
-        log_sum = m + np.log(np.exp(log_sum - m) + np.exp(log_term - m))
-    p = 2.0 * float(np.exp(log_sum))
-    return min(1.0, p)
-
-
 def compute_all(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     probs_pos: np.ndarray,
-    bert_pair_pred: np.ndarray | None = None,
 ) -> dict:
     """Return a comprehensive metrics dict for logging."""
     acc = float(accuracy_score(y_true, y_pred))
@@ -114,18 +82,5 @@ def compute_all(
         "brier_score": brier,
         "ece": ece,
     }
-
-    if bert_pair_pred is not None:
-        # Compare head vs bert baseline on the same filtered subset.
-        # bert_pair_pred is already binary (0=same, 1=A_faster) after the rewrite —
-        # no remapping needed, it aligns 1:1 with our y.
-        bert_acc = float(accuracy_score(y_true, bert_pair_pred))
-        p_mc = mcnemar_p(bert_pair_pred, y_pred, y_true)
-        out["bert_pairwise_baseline_comparison"] = {
-            "bert_same_vs_A_subset_acc": bert_acc,
-            "head_same_vs_A_subset_acc": acc,
-            "delta": acc - bert_acc,
-            "mcnemar_p": p_mc,
-        }
 
     return out

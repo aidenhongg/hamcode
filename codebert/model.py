@@ -1,8 +1,6 @@
-"""GraphCodeBERT classifier with DFG-aware attention.
+"""GraphCodeBERT pointwise classifier with DFG-aware attention.
 
-Both --point and --pair share an encoder (microsoft/graphcodebert-base).
-Difference is only the input construction (done in data.py) and the classifier
-head size: 11 for --point, 3 for --pair.
+Encoder: microsoft/graphcodebert-base. Classifier head: 11-way pointwise.
 
 The model itself is a thin wrapper over HF RobertaModel. The DFG magic is in
 data.py's collator, which builds:
@@ -23,20 +21,18 @@ import torch
 import torch.nn as nn
 from transformers import AutoModel
 
-from common.labels import NUM_PAIR_LABELS, NUM_POINT_LABELS
+from common.labels import NUM_POINT_LABELS
 
 
 class GraphCodeBERTClassifier(nn.Module):
     def __init__(
         self,
         model_name: str = "microsoft/graphcodebert-base",
-        task: str = "point",
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
-        assert task in ("point", "pair"), task
-        self.task = task
-        self.num_labels = NUM_POINT_LABELS if task == "point" else NUM_PAIR_LABELS
+        self.task = "point"
+        self.num_labels = NUM_POINT_LABELS
         self.encoder = AutoModel.from_pretrained(model_name)
         hidden = self.encoder.config.hidden_size
         self.dropout = nn.Dropout(dropout)
@@ -67,36 +63,23 @@ class GraphCodeBERTClassifier(nn.Module):
         torch.save(self.state_dict(), out / "pytorch_model.bin")
         self.encoder.config.save_pretrained(out)
         (out / "codebert_meta.json").write_text(
-            f'{{"task":"{self.task}","num_labels":{self.num_labels},'
+            f'{{"task":"point","num_labels":{self.num_labels},'
             f'"model_name":"{self.model_name}"}}',
             encoding="utf-8",
         )
 
     @classmethod
-    def load_checkpoint(
-        cls,
-        path: str | Path,
-        task: str | None = None,
-    ) -> "GraphCodeBERTClassifier":
+    def load_checkpoint(cls, path: str | Path) -> "GraphCodeBERTClassifier":
         import json
         p = Path(path)
         meta = json.loads((p / "codebert_meta.json").read_text(encoding="utf-8"))
-        use_task = task or meta["task"]
-        model = cls(model_name=meta["model_name"], task=use_task)
+        model = cls(model_name=meta["model_name"])
         state = torch.load(p / "pytorch_model.bin", map_location="cpu")
-        missing, unexpected = model.load_state_dict(state, strict=(use_task == meta["task"]))
+        missing, unexpected = model.load_state_dict(state, strict=True)
         if missing or unexpected:
             print(f"[model] load: missing={len(missing)} unexpected={len(unexpected)}")
         return model
 
-    def load_warm_start_encoder(self, warm_start_dir: str | Path) -> tuple[list[str], list[str]]:
-        """Copy encoder weights from a pointwise checkpoint; reinit classifier."""
-        p = Path(warm_start_dir)
-        state = torch.load(p / "pytorch_model.bin", map_location="cpu")
-        enc_state = {k[len("encoder."):]: v for k, v in state.items() if k.startswith("encoder.")}
-        missing, unexpected = self.encoder.load_state_dict(enc_state, strict=False)
-        return list(missing), list(unexpected)
 
-
-def build_model(model_name: str, task: str, **kwargs: Any) -> GraphCodeBERTClassifier:
-    return GraphCodeBERTClassifier(model_name=model_name, task=task, **kwargs)
+def build_model(model_name: str, **kwargs: Any) -> GraphCodeBERTClassifier:
+    return GraphCodeBERTClassifier(model_name=model_name, **kwargs)

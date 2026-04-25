@@ -1,28 +1,19 @@
-"""Extract frozen BERT pre-softmax logits (+ CLS vectors) for downstream stacking.
+"""Extract frozen pointwise BERT pre-softmax logits (+ CLS vectors) for
+downstream stacking.
 
-Two modes:
-  --point : load pointwise checkpoint, extract 11-d logits + 768-d CLS per code
-  --pair  : load pairwise checkpoint, extract 3-d logits per (code_a, code_b)
-
-Both modes are fp16 autocast on CUDA (RTX 2070 compatible — sm_75, no bf16)
-and fall back to fp32 on CPU. Writes incrementally to parquet so that a
-killed process can be resumed with --resume: already-written code SHA256s
-are skipped on restart.
+Loads a pointwise checkpoint and extracts 11-d logits + 768-d CLS per code.
+Uses fp16 autocast on CUDA (RTX 2070 compatible — sm_75, no bf16) and falls
+back to fp32 on CPU. Writes incrementally to parquet so that a killed process
+can be resumed: already-written code SHA256s are skipped on restart.
 
 Does NOT fine-tune. The model's state_dict is loaded read-only.
 
 CLI:
-    python -m stacking.features.bert_logits --point \
+    python -m stacking.features.bert_logits \
         --ckpt runs/point-20260422-065105/point-20260422-065105/best \
         --in_splits data/processed \
         --out_dir runs/heads/extraction \
         --batch 8 --fp16
-
-    python -m stacking.features.bert_logits --pair \
-        --ckpt runs/pair-20260422-070049/pair-20260422-070049/best \
-        --in_splits data/processed \
-        --out_dir runs/heads/extraction \
-        --batch 4 --fp16
 """
 
 from __future__ import annotations
@@ -68,8 +59,8 @@ def code_sha(code: str) -> str:
 # Model loading (frozen)
 # -----------------------------------------------------------------------------
 
-def load_frozen_model(ckpt_dir: str | Path, task: str) -> tuple[GraphCodeBERTClassifier, "AutoTokenizer"]:
-    """Load a GraphCodeBERTClassifier checkpoint in eval + no-grad mode."""
+def load_frozen_model(ckpt_dir: str | Path) -> tuple[GraphCodeBERTClassifier, "AutoTokenizer"]:
+    """Load a pointwise GraphCodeBERTClassifier checkpoint in eval + no-grad mode."""
     p = Path(ckpt_dir)
     if not (p / "pytorch_model.bin").exists():
         raise FileNotFoundError(
@@ -77,7 +68,7 @@ def load_frozen_model(ckpt_dir: str | Path, task: str) -> tuple[GraphCodeBERTCla
             f"machine or the path is wrong. Expected layout: <ckpt>/pytorch_model.bin + "
             f"<ckpt>/codebert_meta.json"
         )
-    model = GraphCodeBERTClassifier.load_checkpoint(p, task=task)
+    model = GraphCodeBERTClassifier.load_checkpoint(p)
     model.eval()
     for pm in model.parameters():
         pm.requires_grad_(False)
@@ -93,17 +84,6 @@ def _encode_point_batch(codes: list[str], tokenizer, max_seq_len: int) -> dict:
     return tokenizer(
         codes,
         truncation=True,
-        padding="max_length",
-        max_length=max_seq_len,
-        return_tensors="pt",
-    )
-
-
-def _encode_pair_batch(code_a: list[str], code_b: list[str],
-                        tokenizer, max_seq_len: int) -> dict:
-    return tokenizer(
-        code_a, code_b,
-        truncation="longest_first",
         padding="max_length",
         max_length=max_seq_len,
         return_tensors="pt",
@@ -229,7 +209,7 @@ def extract_point(
     device: str | None = None,
     also_cls: bool = True,
 ) -> None:
-    model, tokenizer = load_frozen_model(ckpt_dir, task="point")
+    model, tokenizer = load_frozen_model(ckpt_dir)
     dev = torch.device(device) if device else torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
     )
@@ -317,99 +297,18 @@ def extract_point(
 
 
 # -----------------------------------------------------------------------------
-# Pairwise extraction
-# -----------------------------------------------------------------------------
-
-def extract_pair(
-    ckpt_dir: Path,
-    in_splits: Path,
-    out_dir: Path,
-    max_seq_len: int = 512,
-    batch_size: int = 32,
-    fp16: bool = True,
-    device: str | None = None,
-) -> None:
-    model, tokenizer = load_frozen_model(ckpt_dir, task="pair")
-    dev = torch.device(device) if device else torch.device(
-        "cuda" if torch.cuda.is_available() else "cpu"
-    )
-    print(f"[pair] device={dev} fp16={fp16 and dev.type=='cuda'} "
-          f"batch={batch_size} seq={max_seq_len}", flush=True)
-    model = model.to(dev)
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    n_labels = int(model.num_labels)
-
-    for sp in ("train", "val", "test"):
-        src = in_splits / f"pair_{sp}.parquet"
-        if not src.exists():
-            print(f"[pair] skip missing {src}", flush=True)
-            continue
-        tbl = pq.read_table(src)
-        pair_ids = tbl.column("pair_id").to_pylist()
-        code_a = tbl.column("code_a").to_pylist()
-        code_b = tbl.column("code_b").to_pylist()
-
-        writer = _IncrementalParquetWriter(out_dir, f"pair_logits_{sp}", "pair_id")
-        todo = [
-            (pid, a, b) for pid, a, b in zip(pair_ids, code_a, code_b)
-            if pid not in writer
-        ]
-        if not todo:
-            print(f"[pair] {sp}: all {len(pair_ids)} pairs already extracted", flush=True)
-        else:
-            print(f"[pair] {sp}: {len(todo)}/{len(pair_ids)} pairs to extract", flush=True)
-
-        for start in tqdm(range(0, len(todo), batch_size), desc=f"pair:{sp}"):
-            chunk = todo[start:start + batch_size]
-            batch_ids = [c[0] for c in chunk]
-            batch_a = [c[1] for c in chunk]
-            batch_b = [c[2] for c in chunk]
-            enc = _encode_pair_batch(batch_a, batch_b, tokenizer, max_seq_len)
-            try:
-                logits, _cls = _forward_with_cls(model, enc, dev, use_fp16=fp16)
-            except torch.cuda.OutOfMemoryError:
-                torch.cuda.empty_cache()
-                if batch_size > 1:
-                    print(f"[pair] OOM at batch {batch_size} — falling back to batch//2", flush=True)
-                    batch_size = max(1, batch_size // 2)
-                    continue
-                raise
-
-            logits_np = logits.cpu().numpy().astype(np.float32)
-            cols = {"pair_id": batch_ids}
-            for k in range(n_labels):
-                cols[f"pair_logit_{k}"] = logits_np[:, k]
-            writer.add_batch(pa.table(cols))
-
-        final = out_dir / f"pair_logits_{sp}.parquet"
-        writer.merge(final)
-        print(f"[pair] merged {final}", flush=True)
-
-    (out_dir / "pair_meta.json").write_text(json.dumps({
-        "ckpt_dir": str(ckpt_dir),
-        "model_name": model.model_name,
-        "num_labels": n_labels,
-        "max_seq_len": max_seq_len,
-    }, indent=2), encoding="utf-8")
-
-
-# -----------------------------------------------------------------------------
 # CLI
 # -----------------------------------------------------------------------------
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    mode = ap.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--point", action="store_true")
-    mode.add_argument("--pair", action="store_true")
     ap.add_argument("--ckpt", required=True,
-                    help="path to checkpoint directory with pytorch_model.bin")
+                    help="path to pointwise checkpoint directory with pytorch_model.bin")
     ap.add_argument("--in_splits", default="data/processed")
     ap.add_argument("--out_dir", default="runs/heads/extraction")
     ap.add_argument("--max_seq_len", type=int, default=512)
-    ap.add_argument("--batch", type=int, default=None,
-                    help="Default: 64 for --point, 32 for --pair (tuned for RTX 5090 / 32GB VRAM). "
+    ap.add_argument("--batch", type=int, default=64,
+                    help="Default 64 (tuned for RTX 5090 / 32GB VRAM). "
                          "Halve for 2070-class 8GB cards; quarter on CPU.")
     ap.add_argument("--fp16", action="store_true", default=True,
                     help="Enable CUDA autocast (bf16 if the GPU supports it, else fp16). "
@@ -418,36 +317,19 @@ def main() -> int:
     ap.add_argument("--device", default=None,
                     help="cuda | cpu | cuda:0. Defaults to cuda if available.")
     ap.add_argument("--no_cls", action="store_true",
-                    help="skip CLS vector extraction (point mode only)")
+                    help="skip CLS vector extraction")
     args = ap.parse_args()
 
-    out_dir = Path(args.out_dir)
-    in_splits = Path(args.in_splits)
-    ckpt = Path(args.ckpt)
-
-    if args.point:
-        batch = args.batch if args.batch is not None else 64
-        extract_point(
-            ckpt_dir=ckpt,
-            in_splits=in_splits,
-            out_dir=out_dir,
-            max_seq_len=args.max_seq_len,
-            batch_size=batch,
-            fp16=args.fp16,
-            device=args.device,
-            also_cls=not args.no_cls,
-        )
-    else:
-        batch = args.batch if args.batch is not None else 32
-        extract_pair(
-            ckpt_dir=ckpt,
-            in_splits=in_splits,
-            out_dir=out_dir,
-            max_seq_len=args.max_seq_len,
-            batch_size=batch,
-            fp16=args.fp16,
-            device=args.device,
-        )
+    extract_point(
+        ckpt_dir=Path(args.ckpt),
+        in_splits=Path(args.in_splits),
+        out_dir=Path(args.out_dir),
+        max_seq_len=args.max_seq_len,
+        batch_size=args.batch,
+        fp16=args.fp16,
+        device=args.device,
+        also_cls=not args.no_cls,
+    )
     return 0
 
 

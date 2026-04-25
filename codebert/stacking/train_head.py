@@ -1,16 +1,16 @@
-"""Single-experiment CLI: train one head on one variant with one seed.
+"""Single-experiment CLI: train one head with one seed (variant is fixed at v1).
 
 Usage:
     python -m stacking.train_head \
-        --head xgb --variant v3 --seed 42 \
+        --head xgb --seed 42 \
         --in_splits data/processed \
         --extraction_dir runs/heads/extraction \
-        --out_dir runs/heads/xgb-v3-s42
+        --out_dir runs/heads/xgb-v1-s42
 
 Writes to out_dir:
     config.json           -- resolved config
     metrics.jsonl         -- per-eval or per-epoch metrics (as applicable)
-    test_metrics.json     -- final test metrics + confusion matrix + McNemar
+    test_metrics.json     -- final test metrics + confusion matrix
     predictions.parquet   -- per-pair predictions (for error analysis)
     feature_importance.json (tree heads only)
     confusion_matrix.png  -- saved if matplotlib available
@@ -39,35 +39,6 @@ from stacking import dataset as ds
 from stacking.heads import get_head
 from stacking.heads.base import HeadRegistry, compute_class_weight
 from stacking import metrics as M
-
-
-def _bert_baseline_preds(pair_tbl, pair_logits_tbl, pair_ids: list[str]) -> np.ndarray:
-    """BERT pairwise model's argmax prediction on the binary task.
-
-    After the binary-pair rewrite the pair model emits 2 logits in
-    PAIR_LABELS order = (same, A_faster) — so argmax IS already the
-    binary label we want (0=same, 1=A_faster). No re-mapping needed.
-
-    Falls back to zeros if pair logits are missing or have an
-    unexpected number of columns (e.g. a legacy ternary extraction
-    left over from before the rewrite — surface the mismatch but
-    don't crash the sweep).
-    """
-    cols = [f"pair_logit_{k}" for k in range(2) if f"pair_logit_{k}" in pair_logits_tbl.schema.names]
-    if len(cols) != 2:
-        return np.zeros(len(pair_ids), dtype=np.int64)
-    id_to_row = {id_: i for i, id_ in enumerate(pair_logits_tbl.column("pair_id").to_pylist())}
-    raw = np.stack(
-        [np.asarray(pair_logits_tbl.column(c).to_pylist(), dtype=np.float32) for c in cols],
-        axis=1,
-    )
-    out = np.zeros(len(pair_ids), dtype=np.int64)
-    for i, pid in enumerate(pair_ids):
-        r = id_to_row.get(pid)
-        if r is None:
-            continue
-        out[i] = int(np.argmax(raw[r]))
-    return out
 
 
 def _maybe_plot_confusion(cm: list[list[int]], out_path: Path) -> None:
@@ -120,13 +91,13 @@ def _maybe_plot_roc(y_true: np.ndarray, probs_pos: np.ndarray, out_path: Path) -
 
 def run(
     head_name: str,
-    variant: str,
     seed: int,
     in_splits: Path,
     extraction_dir: Path,
     out_dir: Path,
     class_weight_mode: str = "auto",
     head_hp: dict | None = None,
+    variant: str = "v1",
 ) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -159,16 +130,7 @@ def run(
     test_pred = head.predict(test.X)
     test_prob = head.predict_proba(test.X)[:, 1]
 
-    # BERT baseline on the same filtered test subset (if pair logits exist)
-    pair_logit_pq = extraction_dir / "pair_logits_test.parquet"
-    bert_pred = None
-    if pair_logit_pq.exists():
-        pair_tbl = pq.read_table(in_splits / "pair_test.parquet")
-        pair_tbl = ds.filter_b_ge_a(pair_tbl)
-        pl_tbl = pq.read_table(pair_logit_pq)
-        bert_pred = _bert_baseline_preds(pair_tbl, pl_tbl, test.pair_ids)
-
-    test_met = M.compute_all(test.y, test_pred, test_prob, bert_pair_pred=bert_pred)
+    test_met = M.compute_all(test.y, test_pred, test_prob)
     test_met["split"] = "test"
 
     # Config + metrics
@@ -203,7 +165,6 @@ def run(
         "label_pred": test_pred.astype(np.int64),
         "prob_same": 1.0 - test_prob.astype(np.float32),
         "prob_A_faster": test_prob.astype(np.float32),
-        **({"bert_pair_pred": bert_pred.astype(np.int64)} if bert_pred is not None else {}),
     })
     pq.write_table(pred_table, out_dir / "predictions.parquet", compression="zstd")
 
@@ -240,10 +201,6 @@ def run(
     print(f"[train_head] test acc={test_met['accuracy']:.4f} "
           f"macro_f1={test_met['macro_f1']:.4f} "
           f"roc_auc={test_met['roc_auc']:.4f}", flush=True)
-    if "bert_pairwise_baseline_comparison" in test_met:
-        b = test_met["bert_pairwise_baseline_comparison"]
-        print(f"[train_head] vs BERT pairwise baseline: "
-              f"delta_acc={b['delta']:+.4f} mcnemar_p={b['mcnemar_p']:.4f}", flush=True)
 
     return test_met
 
@@ -265,21 +222,19 @@ def _jsonable(obj: Any) -> Any:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--head", required=True, choices=HeadRegistry.all())
-    ap.add_argument("--variant", required=True, choices=["v1", "v2", "v3"])
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--in_splits", default="data/processed")
     ap.add_argument("--extraction_dir", default="runs/heads/extraction")
     ap.add_argument("--out_dir", default=None,
-                    help="Default: runs/heads/{head}-{variant}-s{seed}")
+                    help="Default: runs/heads/{head}-v1-s{seed}")
     ap.add_argument("--class_weight", default="auto", choices=["auto", "none"])
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir) if args.out_dir else Path(
-        f"runs/heads/{args.head}-{args.variant}-s{args.seed}"
+        f"runs/heads/{args.head}-v1-s{args.seed}"
     )
     run(
         head_name=args.head,
-        variant=args.variant,
         seed=args.seed,
         in_splits=Path(args.in_splits),
         extraction_dir=Path(args.extraction_dir),

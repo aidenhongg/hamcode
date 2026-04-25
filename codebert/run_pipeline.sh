@@ -3,9 +3,9 @@
 #   ./run_pipeline.sh           full run
 #   ./run_pipeline.sh --smoke   tiny sample for local sanity-check
 #
-# After this finishes, train with:
-#   python train.py --point --data_dir data/processed
-#   python train.py --pair  --warm_start_from runs/point-*/best --data_dir data/processed
+# After this finishes, train pointwise BERT with:
+#   python train.py --data_dir data/processed
+# Then run the stacking pipeline (stacking/scripts/run_runpod.sh) for heads.
 set -euo pipefail
 
 SMOKE=0

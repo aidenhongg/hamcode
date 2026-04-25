@@ -1,17 +1,18 @@
-"""Join AST + BERT logit + semantic-similarity features into a head-ready matrix.
+"""Join AST + pointwise BERT logit + semantic-similarity features into a
+head-ready matrix.
 
 Filters to the B>=A subset (drops ternary=='B_faster'), derives the binary
-label y (1 for A_faster, 0 for same), builds the feature matrix for one of
-three BERT variants, and fits a z-score scaler on the TRAIN split only.
+label y (1 for A_faster, 0 for same), builds the feature matrix from
+pointwise BERT logits + AST diffs + CLS similarity, and fits a z-score
+scaler on the TRAIN split only.
 
 The scaler discipline is enforced: the fitted scaler object is saved to
 disk and reused on val/test. Boolean AST features (recursion_present etc.)
 bypass the scaler.
 
-Variants:
-  v1 -- "A pt + B pt": pointwise logits for A and B concatenated with diff/|diff|
-  v2 -- "pair only":   just the 3-d pairwise logit vector
-  v3 -- "full":        v1 columns + v2 columns
+Variant: only `v1` is supported. After dropping pairwise BERT fine-tuning
+the v2/v3 inputs (pair logits) no longer exist; v1 = "A pt + B pt": pointwise
+logits for A and B concatenated with diff/|diff|.
 """
 
 from __future__ import annotations
@@ -32,11 +33,9 @@ from sklearn.preprocessing import StandardScaler
 from .features.ast_features import FEATURE_KIND, FEATURE_NAMES, diff_columns
 
 
-Variant = Literal["v1", "v2", "v3"]
+Variant = Literal["v1"]
 VARIANT_DESCRIPTIONS = {
     "v1": "A + B pointwise logits (+ diff, |diff|)",
-    "v2": "Pairwise logits only",
-    "v3": "A+B pointwise + pairwise (everything)",
 }
 
 
@@ -76,11 +75,6 @@ def _point_logit_columns(n_labels: int = 11) -> list[str]:
     return [f"point_logit_{k}" for k in range(n_labels)]
 
 
-def _pair_logit_columns(n_labels: int = 2) -> list[str]:
-    # Default 2 after the binary-pair rewrite (was 3 under ternary head).
-    return [f"pair_logit_{k}" for k in range(n_labels)]
-
-
 # -----------------------------------------------------------------------------
 # Joined feature matrix
 # -----------------------------------------------------------------------------
@@ -113,26 +107,6 @@ def _load_or_empty(path: Path, name: str) -> "pq.Table | None":
         print(f"[dataset] {name} missing: {path}", flush=True)
         return None
     return pq.read_table(path)
-
-
-def _join_pair_logits(pair_ids: list[str], pair_logits_tbl) -> tuple[np.ndarray, list[str]]:
-    """Align pair logits to the order of pair_ids. Fills missing with zeros."""
-    id_to_row = {id_: i for i, id_ in enumerate(pair_logits_tbl.column("pair_id").to_pylist())}
-    cols = _pair_logit_columns()
-    n = len(pair_ids)
-    mat = np.zeros((n, len(cols)), dtype=np.float32)
-    raw = {c: pair_logits_tbl.column(c).to_pylist() for c in cols}
-    missing = 0
-    for i, pid in enumerate(pair_ids):
-        r = id_to_row.get(pid)
-        if r is None:
-            missing += 1
-            continue
-        for j, c in enumerate(cols):
-            mat[i, j] = raw[c][r]
-    if missing:
-        print(f"[dataset] pair logits: {missing}/{n} missing, zero-filled", flush=True)
-    return mat, [f"pair_{c}" for c in cols]
 
 
 def _join_point_logits(
@@ -269,24 +243,14 @@ def build_feature_matrix(
                 # Scaling: booleans skip; counts/cont get scaled (log1p'd below)
                 scaled_flags.append(kind != "bool")
 
-    # BERT logits per variant
-    if variant in ("v1", "v3"):
-        logit_pq = extraction_dir / f"point_logits_{split}.parquet"
-        logit_tbl = _load_or_empty(logit_pq, "point_logits")
-        if logit_tbl is not None:
-            mat, cols = _join_point_logits(pair_tbl, point_pq, logit_tbl)
-            blocks.append(mat)
-            col_names.extend(cols)
-            scaled_flags.extend([True] * len(cols))
-
-    if variant in ("v2", "v3"):
-        pair_logit_pq = extraction_dir / f"pair_logits_{split}.parquet"
-        pl_tbl = _load_or_empty(pair_logit_pq, "pair_logits")
-        if pl_tbl is not None:
-            mat, cols = _join_pair_logits(pair_ids, pl_tbl)
-            blocks.append(mat)
-            col_names.extend(cols)
-            scaled_flags.extend([True] * len(cols))
+    # Pointwise BERT logits (v1 only — pair logits are gone)
+    logit_pq = extraction_dir / f"point_logits_{split}.parquet"
+    logit_tbl = _load_or_empty(logit_pq, "point_logits")
+    if logit_tbl is not None:
+        mat, cols = _join_point_logits(pair_tbl, point_pq, logit_tbl)
+        blocks.append(mat)
+        col_names.extend(cols)
+        scaled_flags.extend([True] * len(cols))
 
     # Similarity
     if include_sim:
@@ -303,7 +267,7 @@ def build_feature_matrix(
         raise RuntimeError(
             f"No feature blocks built for {split}/{variant}. Check extraction_dir "
             f"has ast_pair_{split}.parquet, point_logits_{split}.parquet, "
-            f"pair_logits_{split}.parquet, pair_sim_{split}.parquet."
+            f"pair_sim_{split}.parquet."
         )
 
     X = np.concatenate(blocks, axis=1)

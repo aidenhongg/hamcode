@@ -1,10 +1,9 @@
-"""Train GraphCodeBERT on pointwise or pairwise code-complexity tasks.
+"""Train GraphCodeBERT on the pointwise code-complexity task.
 
 Usage:
-    python train.py --point --data_dir data/processed --epochs 8
-    python train.py --pair  --data_dir data/processed --warm_start_from runs/point-v1/best
+    python train.py --data_dir data/processed --epochs 8
 
-Loads defaults from configs/point.yaml (or pair.yaml). CLI flags override.
+Loads defaults from configs/point.yaml. CLI flags override.
 
 Writes to --output_dir:
     best/                  HF-format checkpoint (model + tokenizer config)
@@ -66,27 +65,25 @@ def setup_logging(out_dir: Path, level: int = logging.INFO) -> None:
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from data import (
-    PairDataset,
     PointDataset,
     compute_class_weights,
     make_collator,
 )
-from metrics import pairwise_metrics, pointwise_metrics, pretty_confusion
+from metrics import pointwise_metrics, pretty_confusion
 from model import build_model
-from common.labels import PAIR_LABELS, POINT_LABELS
+from common.labels import POINT_LABELS
 
 
 # ------------------------------------------------------------------ config
 
 @dataclass
 class Config:
-    task: str = "point"
     model_name: str = "microsoft/graphcodebert-base"
     data_dir: str = "data/processed"
     output_dir: str = ""
     # Explicit per-split parquet overrides. Used by OOF driver (stacking/features/oof_point.py)
     # to point at fold-specific files without mutating data_dir layout. Empty string means
-    # fall back to data_dir/<train|val|test>.parquet (point) or data_dir/pair_<split>.parquet (pair).
+    # fall back to data_dir/<train|val|test>.parquet.
     train_parquet: str = ""
     val_parquet: str = ""
     test_parquet: str = ""
@@ -101,7 +98,6 @@ class Config:
     label_smoothing: float = 0.0
     bf16: bool = True
     class_weights: str = "auto"           # auto | none | PATH
-    warm_start_from: str = ""
     seed: int = 42
     eval_every_steps: int = 200
     patience: int = 3               # stop after this many consecutive evals with no delta-improvement
@@ -113,25 +109,25 @@ class Config:
     prefetch_factor: int = 4
     cache_dir: str = ""
     use_dfg: bool = False   # DEFAULT: simple tokenization, no DFG. Set True for paper-faithful.
-    balanced_sampler: bool = True   # WeightedRandomSampler on train for point-mode
+    balanced_sampler: bool = True   # WeightedRandomSampler on train
 
 
 def load_config(cli: argparse.Namespace) -> Config:
-    cfg_path = Path("configs") / f"{cli.task}.yaml"
+    cfg_path = Path("configs") / "point.yaml"
     base: dict[str, Any] = {}
     if cfg_path.exists():
         with cfg_path.open("r", encoding="utf-8") as f:
             base = yaml.safe_load(f) or {}
-    base["task"] = cli.task
+    base.pop("task", None)  # legacy field, no longer used
     # Overlay CLI flags (non-None only)
     for k, v in vars(cli).items():
-        if v is None or k in {"point", "pair"}:
+        if v is None:
             continue
         base[k] = v
     cfg = Config(**{k: v for k, v in base.items() if k in Config.__dataclass_fields__})
     if not cfg.output_dir:
         ts = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-        cfg.output_dir = f"runs/{cfg.task}-{ts}"
+        cfg.output_dir = f"runs/point-{ts}"
     return cfg
 
 
@@ -153,7 +149,7 @@ def linear_warmup_linear_decay(optimizer, num_warmup: int, num_total: int):
 
 
 def resolve_class_weights(cfg: Config) -> torch.Tensor | None:
-    if cfg.task != "point" or cfg.class_weights == "none":
+    if cfg.class_weights == "none":
         return None
     if cfg.class_weights == "auto":
         train_pq = Path(cfg.train_parquet) if cfg.train_parquet else (
@@ -169,7 +165,7 @@ def resolve_class_weights(cfg: Config) -> torch.Tensor | None:
 
 # ------------------------------------------------------------------ train loop
 
-def evaluate(model, loader, device, task: str, max_batches: int | None = None) -> dict:
+def evaluate(model, loader, device, max_batches: int | None = None) -> dict:
     model.eval()
     all_preds: list[int] = []
     all_labels: list[int] = []
@@ -189,9 +185,7 @@ def evaluate(model, loader, device, task: str, max_batches: int | None = None) -
             all_preds.extend(preds)
             all_labels.extend(labels)
     iterable.close() if hasattr(iterable, "close") else None
-    if task == "point":
-        return pointwise_metrics(all_preds, all_labels)
-    return pairwise_metrics(all_preds, all_labels)
+    return pointwise_metrics(all_preds, all_labels)
 
 
 def save_state(model, optimizer, scheduler, scaler, step, epoch, out: Path) -> None:
@@ -233,9 +227,6 @@ def load_state(model, optimizer, scheduler, scaler, in_dir: Path):
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    mode = ap.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--point", dest="task", action="store_const", const="point")
-    mode.add_argument("--pair", dest="task", action="store_const", const="pair")
     # Overrides (None means "inherit from yaml")
     ap.add_argument("--model_name", default=None)
     ap.add_argument("--data_dir", default=None)
@@ -258,7 +249,6 @@ def main() -> int:
     ap.add_argument("--bf16", action="store_true", default=None)
     ap.add_argument("--no_bf16", dest="bf16", action="store_false")
     ap.add_argument("--class_weights", default=None)
-    ap.add_argument("--warm_start_from", default=None)
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--eval_every_steps", type=int, default=None)
     ap.add_argument("--patience", type=int, default=None)
@@ -275,7 +265,7 @@ def main() -> int:
     ap.add_argument("--no_dfg", dest="use_dfg", action="store_false",
                     help="Simple mode (default): standard 1D tokenization, no DFG")
     ap.add_argument("--balanced_sampler", action="store_true", default=None,
-                    help="WeightedRandomSampler on train set (point only; default on)")
+                    help="WeightedRandomSampler on train set (default on)")
     ap.add_argument("--no_balanced_sampler", dest="balanced_sampler", action="store_false",
                     help="Plain shuffled sampler; rely only on loss class weights")
     args = ap.parse_args()
@@ -300,16 +290,10 @@ def main() -> int:
     data_root = Path(cfg.data_dir)
     logger.info("tokenizer ready (vocab=%d)", tokenizer.vocab_size)
 
-    if cfg.task == "point":
-        train_path = Path(cfg.train_parquet) if cfg.train_parquet else data_root / "train.parquet"
-        val_path = Path(cfg.val_parquet) if cfg.val_parquet else data_root / "val.parquet"
-        test_path = Path(cfg.test_parquet) if cfg.test_parquet else data_root / "test.parquet"
-        DS = PointDataset
-    else:
-        train_path = Path(cfg.train_parquet) if cfg.train_parquet else data_root / "pair_train.parquet"
-        val_path = Path(cfg.val_parquet) if cfg.val_parquet else data_root / "pair_val.parquet"
-        test_path = Path(cfg.test_parquet) if cfg.test_parquet else data_root / "pair_test.parquet"
-        DS = PairDataset
+    train_path = Path(cfg.train_parquet) if cfg.train_parquet else data_root / "train.parquet"
+    val_path = Path(cfg.val_parquet) if cfg.val_parquet else data_root / "val.parquet"
+    test_path = Path(cfg.test_parquet) if cfg.test_parquet else data_root / "test.parquet"
+    DS = PointDataset
     logger.info("data paths: train=%s val=%s test=%s", train_path, val_path, test_path)
 
     logger.info("loading datasets from %s ...", data_root)
@@ -344,12 +328,10 @@ def main() -> int:
     )
 
     # Balanced sampling: inverse-frequency over-sampling so every batch is ~class-balanced.
-    # Complementary to class_weights in loss (both can be on). Only wire for --point;
-    # pairwise labels are binary (same / A_faster) post-rewrite — skew is typically
-    # ~2-3:1 which class_weight handles without needing a sampler.
+    # Complementary to class_weights in loss (both can be on).
     train_sampler = None
     train_shuffle = True
-    if cfg.task == "point" and cfg.balanced_sampler:
+    if cfg.balanced_sampler:
         import pyarrow.parquet as _pq
         labels_raw = _pq.read_table(train_path).column("label").to_pylist()
         from common.labels import LABEL_TO_IDX
@@ -375,12 +357,8 @@ def main() -> int:
                 train_sampler is not None)
 
     # --- model -----
-    logger.info("building model (%s, task=%s) ...", cfg.model_name, cfg.task)
-    model = build_model(cfg.model_name, cfg.task)
-    if cfg.warm_start_from:
-        miss, unex = model.load_warm_start_encoder(cfg.warm_start_from)
-        logger.info("warm-start from %s (missing=%d unexpected=%d)",
-                    cfg.warm_start_from, len(miss), len(unex))
+    logger.info("building model (%s) ...", cfg.model_name)
+    model = build_model(cfg.model_name)
     logger.info("moving model to %s ...", device)
     model = model.to(device)
     n_params = sum(p.numel() for p in model.parameters())
@@ -486,7 +464,7 @@ def main() -> int:
                         logger.info("epoch=%d step=%d lr=%.2e loss=%.4f",
                                     epoch, step, scheduler.get_last_lr()[0], loss_val)
                     if step > 0 and step % cfg.eval_every_steps == 0:
-                        met = evaluate(model, dl_val, device, cfg.task)
+                        met = evaluate(model, dl_val, device)
                         rec = {"step": step, "epoch": epoch, "split": "val", **_log_safe(met)}
                         metrics_log.write(json.dumps(rec) + "\n"); metrics_log.flush()
                         loss_log.flush()
@@ -511,7 +489,7 @@ def main() -> int:
                                             step, best_f1, best_epoch)
                                 save_state(model, optimizer, scheduler, scaler, step, epoch, out_root / "last")
                                 metrics_log.close(); loss_log.close()
-                                return _final_report(model, dl_test, device, cfg.task, out_root, cfg)
+                                return _final_report(model, dl_test, device, out_root, cfg)
                         model.train()
 
             pbar.close()
@@ -523,7 +501,7 @@ def main() -> int:
 
     metrics_log.close(); loss_log.close()
     logger.info("training complete (best macro_f1=%.4f @ epoch %d)", best_f1, best_epoch)
-    return _final_report(model, dl_test, device, cfg.task, out_root, cfg)
+    return _final_report(model, dl_test, device, out_root, cfg)
 
 
 def _log_safe(met: dict) -> dict:
@@ -538,22 +516,19 @@ def _log_safe(met: dict) -> dict:
     return flat
 
 
-def _final_report(model, dl_test, device, task: str, out_root: Path, cfg: Config) -> int:
+def _final_report(model, dl_test, device, out_root: Path, cfg: Config) -> int:
     best_dir = out_root / "best"
     if best_dir.exists() and (best_dir / "pytorch_model.bin").exists():
         state = torch.load(best_dir / "pytorch_model.bin", map_location=device)
         model.load_state_dict(state)
-    met = evaluate(model, dl_test, device, task)
+    met = evaluate(model, dl_test, device)
     met["seed"] = cfg.seed
-    met["task"] = task
+    met["task"] = "point"
     (out_root / "test_metrics.json").write_text(json.dumps(met, indent=2), encoding="utf-8")
     logger.info("=== TEST METRICS ===")
     logger.info("accuracy=%.4f macro_f1=%.4f", met["accuracy"], met["macro_f1"])
-    if task == "point":
-        logger.info("within_1_tier_accuracy=%.4f", met["within_1_tier_accuracy"])
-        logger.info("\n%s", pretty_confusion(met["confusion_matrix"], POINT_LABELS))
-    else:
-        logger.info("\n%s", pretty_confusion(met["confusion_matrix"], PAIR_LABELS))
+    logger.info("within_1_tier_accuracy=%.4f", met["within_1_tier_accuracy"])
+    logger.info("\n%s", pretty_confusion(met["confusion_matrix"], POINT_LABELS))
     # Auto-plot (best-effort; matplotlib may be absent)
     try:
         from plot_metrics import plot_all as _plot_all

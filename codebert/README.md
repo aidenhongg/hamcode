@@ -1,10 +1,16 @@
-# codebert — GraphCodeBERT complexity classifier
+# codebert — GraphCodeBERT pointwise complexity classifier
 
 Fine-tunes [microsoft/graphcodebert-base](https://huggingface.co/microsoft/graphcodebert-base)
-for Python time-complexity classification. Two modes share one script:
+for Python time-complexity classification (pointwise, 11-class).
 
-- `python train.py --point` — pointwise 11-class classification (one snippet → class).
-- `python train.py --pair`  — pairwise ternary ranking (two snippets → A / same / B faster).
+```bash
+python train.py --data_dir data/processed
+```
+
+The pointwise BERT logits feed the stacking heads under `stacking/` (see
+[stacking/README.md](stacking/README.md)). The heads themselves classify pairs
+(`same` / `A_faster`) using pointwise logits + AST diffs + CLS similarity.
+Pairwise BERT fine-tuning was retired.
 
 ## Classes (11)
 
@@ -12,16 +18,12 @@ Single-variable (7): `O(1)`, `O(log n)`, `O(n)`, `O(n log n)`, `O(n^2)`, `O(n^3)
 
 Multi-variable (4): `O(m+n)`, `O(m*n)`, `O(m log n)`, `O((m+n) log(m+n))`.
 
-## Pairwise label
-
-Ordinal tier (assumes `m ≈ n`). Same tier → `same`; otherwise `A_faster` / `B_faster`.
-
 ## What's in the box
 
 | Script | What it does |
 |--------|--------------|
-| `train.py --point \| --pair` | AdamW + linear warmup/decay, bf16, early stop on dev macro-F1, best-ckpt save, resume, file logging (`train.log`), train-loss JSONL, auto-plots at end |
-| `predict.py` | Load checkpoint, infer on file/stdin/pair, emit JSON |
+| `train.py` | AdamW + linear warmup/decay, bf16, early stop on dev macro-F1, best-ckpt save, resume, file logging (`train.log`), train-loss JSONL, auto-plots at end |
+| `predict.py` | Load checkpoint, infer on file/stdin, emit JSON |
 | `tune.py`   | Optuna HP search (lr, warmup, weight decay, batch, epochs, seed, label smoothing); TPE sampler + median pruner; resumable via SQLite study DB |
 | `pick_best.py` | Scan multi-seed runs, pick the one with best test macro-F1, copy to a unified `best/` |
 | `plot_metrics.py` | Eval curves, train-loss EMA, row-normalized confusion matrix, per-class F1 bar chart |
@@ -39,24 +41,18 @@ pip install --index-url https://download.pytorch.org/whl/cu128 torch==2.6.0
 # Build the dataset (clones doocs/leetcode, downloads CodeComplex, generates synthetics)
 ./run_pipeline.sh
 
-# Train pointwise
-python train.py --point --data_dir data/processed --output_dir runs/point-v1
-
-# Warm-start pairwise
-python train.py --pair  --data_dir data/processed --warm_start_from runs/point-v1/best \
-                         --output_dir runs/pair-v1
+# Train pointwise BERT
+python train.py --data_dir data/processed --output_dir runs/point-v1
 
 # Inference
 python predict.py --model_dir runs/point-v1/best --input examples/linear.py
-python predict.py --model_dir runs/pair-v1/best  --pair examples/linear.py examples/quadratic.py
 ```
 
 ## Smoke test (local / tiny data)
 
 ```bash
 ./run_pipeline.sh --smoke
-python train.py --point --dry_run --data_dir data/processed
-python train.py --pair  --dry_run --data_dir data/processed
+python train.py --dry_run --data_dir data/processed
 ```
 
 ## Multi-seed + HP tuning
@@ -64,12 +60,12 @@ python train.py --pair  --dry_run --data_dir data/processed
 ```bash
 # Train 5 seeds, pick winner
 for s in 42 43 44 45 46; do
-  python train.py --point --seed $s --output_dir runs/point-s$s --data_dir data/processed
+  python train.py --seed $s --output_dir runs/point-s$s --data_dir data/processed
 done
 python pick_best.py --globs 'runs/point-s*' --out_dir runs/point-best
 
 # Optuna HP search (12 trials, best params written to runs/tune/best.json)
-python tune.py --point --n_trials 12 --study point-tune \
+python tune.py --n_trials 12 --study point-tune \
                --data_dir data/processed --base_output_dir runs/tune/point
 ```
 
@@ -104,19 +100,20 @@ CodeComplex auto-fetch tries several URLs; if none reach, drop the jsonl at
 ## Layout
 
 ```
-train.py           # CLI: --point | --pair
+train.py           # CLI: pointwise training
 predict.py         # inference CLI
-data.py            # Dataset + DFG-aware collator
+data.py            # PointDataset + DFG-aware collator
 model.py           # GraphCodeBERT + classification head
-metrics.py         # pointwise/pairwise + confusion matrix
+metrics.py         # pointwise metrics + confusion matrix
 common/            # labels, schemas, normalizer, DFG cache
 parser/            # vendored microsoft/CodeBERT parser (MIT)
 pipeline/          # 01-11 data scripts (DAG-ordered by numeric prefix)
-configs/           # point.yaml, pair.yaml (CLI overrides them)
+configs/           # point.yaml (CLI overrides them)
 data/raw/          # cloned repos + downloaded jsonl
-data/processed/    # final parquet (pointwise + pairwise; per-split files)
+data/processed/    # final parquet (pointwise + pair labels for the head; per-split files)
 data/audit/        # parse failures, reject reasons, stats.json
 runs/              # checkpoints (best/ + last/)
+stacking/          # second-stage classifiers (xgb/lgbm/mlp/stacked) on top of frozen BERT logits
 ```
 
 ## License

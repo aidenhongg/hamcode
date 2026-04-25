@@ -1,13 +1,13 @@
 """Optuna HP search for the top heads (xgb, lgbm, mlp, stacked).
 
-Per (head, variant) cell:
+Per head cell (variant fixed at v1 — pairwise BERT inputs are gone):
   1. Build train/val/test feature matrices once with the shared scaler.
   2. Run Optuna with TPE + MedianPruner over head-specific search space,
      objective = val macro-F1, with class_weight='auto'.
   3. Take best HPs, retrain on train with same val, evaluate on test with
      N_SEEDS different seeds; report mean ± std.
   4. Persist:
-        runs/heads/hp/<head>-<variant>/
+        runs/heads/hp/<head>-v1/
           study.db                 # SQLite Optuna storage, resumable
           best_params.json         # winning HPs
           trials.jsonl             # every trial (params + val score)
@@ -15,13 +15,11 @@ Per (head, variant) cell:
           summary.json             # headline numbers
   5. Aggregate to runs/heads/hp/HP_SUMMARY.md + HP_SUMMARY.csv.
 
-Runs sequentially. Variants default to v1,v3 (v2 consistently loses —
-skip unless you specifically want to include it via --variants v1,v2,v3).
+Runs sequentially.
 
 CLI:
     python -m stacking.hp_search \
         --heads xgb,lgbm,mlp,stacked \
-        --variants v1,v3 \
         --trials 40 --seeds 42,43,44 \
         --in_splits data/processed \
         --extraction_dir runs/heads/extraction \
@@ -409,8 +407,6 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--heads", default="xgb,lgbm,mlp,stacked",
                     help="Comma-separated subset of xgb,lgbm,mlp,stacked")
-    ap.add_argument("--variants", default="v1,v3",
-                    help="Comma-separated subset of v1,v2,v3")
     ap.add_argument("--trials", type=int, default=40,
                     help="Optuna trials per (head, variant) cell")
     ap.add_argument("--seeds", default="42,43,44",
@@ -429,7 +425,7 @@ def main() -> int:
     args = ap.parse_args()
 
     heads = _parse_list(args.heads)
-    variants = _parse_list(args.variants)
+    variants = ["v1"]   # v2/v3 retired with pairwise BERT
     seeds = _parse_seeds(args.seeds)
     out_root = Path(args.out_root)
     out_root.mkdir(parents=True, exist_ok=True)

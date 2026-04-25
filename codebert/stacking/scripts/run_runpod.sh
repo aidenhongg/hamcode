@@ -4,30 +4,33 @@
 # Assumes: CUDA 12.8+ torch already installed (see requirements.txt note),
 # this repo checked out to the pod, and you are inside codebert/.
 #
-# What it does (leakage-fixed, unlike the legacy path):
+# What it does:
 #   1. Build the dataset (run_pipeline.sh)
 #   2. Extract AST features (CPU, ~15s)
 #   3. OOF pointwise: K-fold train pointwise BERT + emit unbiased train logits,
 #      then train full-train pointwise model and emit val/test logits + CLS.
-#      (Replaces legacy bert_logits --point which leaks train features.)
 #   4. Semantic similarity from CLS (CPU, ~1s)
-#   5. OOF pairwise: same idea for the pair BERT.
-#      (Replaces legacy bert_logits --pair which leaks train features.)
-#   6. Run the 72-experiment head sweep.
+#   5. Run the head sweep (top-4 heads x v1 x 3 seeds = 12 experiments).
+#   6. HP search on top heads.
 #
-# Total GPU time on 5090 ballpark (dataset ~5K point / ~30K pair):
+# Pairwise BERT fine-tuning was retired — heads now consume only pointwise
+# logits + AST diffs + CLS similarity (variant v1).
+#
+# Total GPU time on 5090 ballpark (dataset ~5K point):
 #   - OOF point:  5 folds x ~10min train + extraction = ~60min
-#   - OOF pair:   5 folds x ~25min train + extraction = ~140min
-#   - Sweep:      ~10min CPU
-#   ≈ 3.5 hours wallclock.
+#   - Sweep + HP: ~2-4h CPU
+#   ≈ 3-5 hours wallclock.
 #
 # Usage:
-#   bash stacking/scripts/run_runpod.sh [--skip-data] [--skip-oof-pair] [--n_folds 5]
+#   bash stacking/scripts/run_runpod.sh [--skip-data] [--n_folds 5]
 #
 # Flags:
 #   --skip-data     : dataset already built under data/processed/
-#   --skip-oof-point: OOF pointwise already done (resume into pair + sweep)
-#   --skip-oof-pair : skip OOF for pair (accepts pair-side leakage as a known limitation)
+#   --skip-oof-point: OOF pointwise already done
+#   --skip-sweep    : skip the head sweep
+#   --skip-hp       : skip HP search
+#   --hp-trials N   : Optuna trials per head (default 40)
+#   --hp-heads CSV  : default 'xgb,lgbm,mlp,stacked'
 #   --n_folds N     : number of folds (default 5)
 #   --extraction_dir DIR : override output root (default runs/heads/extraction)
 
@@ -52,12 +55,10 @@ export HF_HUB_DOWNLOAD_TIMEOUT=30
 
 SKIP_DATA=0
 SKIP_POINT=0
-SKIP_PAIR=0
 SKIP_SWEEP=0
 SKIP_HP=0
 HP_TRIALS=40
 HP_HEADS="xgb,lgbm,mlp,stacked"
-HP_VARIANTS="v1,v3"
 N_FOLDS=5
 EXTRACTION_DIR="runs/heads/extraction"
 OUT_ROOT="runs/heads"
@@ -66,12 +67,10 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --skip-data) SKIP_DATA=1 ;;
         --skip-oof-point) SKIP_POINT=1 ;;
-        --skip-oof-pair) SKIP_PAIR=1 ;;
         --skip-sweep) SKIP_SWEEP=1 ;;
         --skip-hp) SKIP_HP=1 ;;
         --hp-trials) HP_TRIALS="$2"; shift ;;
         --hp-heads) HP_HEADS="$2"; shift ;;
-        --hp-variants) HP_VARIANTS="$2"; shift ;;
         --n_folds) N_FOLDS="$2"; shift ;;
         --extraction_dir) EXTRACTION_DIR="$2"; shift ;;
         --out_root) OUT_ROOT="$2"; shift ;;
@@ -82,7 +81,7 @@ done
 
 mkdir -p "$EXTRACTION_DIR" "$OUT_ROOT"
 
-echo "=== [0/6] Environment sanity ==="
+echo "=== [0/5] Environment sanity ==="
 # torchvision / torchaudio preinstalled on the base image nearly always mismatch
 # the cu128 torch we install on top, causing transformers' lazy-vision import
 # to crash with "operator torchvision::nms does not exist". We never use them —
@@ -92,15 +91,13 @@ if python -c "import torchvision" 2>/dev/null; then
     pip uninstall -y torchvision torchaudio >/dev/null 2>&1 || true
 fi
 
-echo "=== [0.5/6] GPU + transformers sanity (still ONLINE for pre-download) ==="
+echo "=== [0.5/5] GPU + transformers sanity (still ONLINE for pre-download) ==="
 python -c "import torch; assert torch.cuda.is_available(), 'no CUDA'; print('GPU:', torch.cuda.get_device_name(0), 'torch:', torch.__version__, 'bf16:', torch.cuda.is_bf16_supported())"
 
-echo "=== [1/6] Pre-download microsoft/graphcodebert-base from main (no PR refs) ==="
+echo "=== [1/5] Pre-download microsoft/graphcodebert-base from main (no PR refs) ==="
 # snapshot_download walks repo_id@revision and fetches only the allow-listed
 # files. It never falls through to PR refs — that fallback is strictly a
-# transformers.from_pretrained behaviour, not huggingface_hub's. After this
-# step the HF cache has everything we need, and we can lock into offline
-# mode so no subsequent subprocess is ever tempted to call home.
+# transformers.from_pretrained behaviour, not huggingface_hub's.
 python -c "
 from huggingface_hub import snapshot_download
 p = snapshot_download(
@@ -120,13 +117,11 @@ p = snapshot_download(
 print('cached at', p)
 "
 
-# Lock the rest of the pipeline into offline mode. Both names are honoured by
-# huggingface_hub.constants: HF_HUB_OFFLINE = _is_true(os.environ.get(
-# 'HF_HUB_OFFLINE') or os.environ.get('TRANSFORMERS_OFFLINE')).
+# Lock the rest of the pipeline into offline mode.
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 
-echo "=== [1.5/6] Offline-mode smoke: load encoder from cache only ==="
+echo "=== [1.5/5] Offline-mode smoke: load encoder from cache only ==="
 python -c "
 from transformers import AutoModel, AutoTokenizer
 _t = AutoTokenizer.from_pretrained('microsoft/graphcodebert-base')
@@ -135,21 +130,21 @@ print('encoder + tokenizer load OK from cache (offline)')
 "
 
 if [ "$SKIP_DATA" -eq 0 ]; then
-    echo "=== [2/6] Building dataset ==="
+    echo "=== [2/5] Building dataset ==="
     bash run_pipeline.sh
 else
-    echo "=== [2/6] Skipping dataset build (--skip-data) ==="
+    echo "=== [2/5] Skipping dataset build (--skip-data) ==="
 fi
 
-echo "=== [3/6] AST feature extraction ==="
+echo "=== [3/5] AST feature extraction ==="
 python -m stacking.features.ast_features \
     --in_splits data/processed \
     --out_dir "$EXTRACTION_DIR"
 
 if [ "$SKIP_POINT" -eq 0 ]; then
-    echo "=== [4/6] OOF pointwise BERT (leakage fix, 40-epoch cap) ==="
-    # Tuned for 5090 / 32GB VRAM. Warm-starts off fresh GraphCodeBERT-base per
-    # fold. Generous epoch cap — patience=3 stops most folds at ~15-20 epochs.
+    echo "=== [4/5] OOF pointwise BERT (leakage fix, 40-epoch cap) ==="
+    # Tuned for 5090 / 32GB VRAM. Generous epoch cap — patience=3 stops most
+    # folds at ~15-20 epochs.
     python -m stacking.features.oof_point \
         --data_dir data/processed \
         --out_dir "$EXTRACTION_DIR" \
@@ -166,83 +161,44 @@ if [ "$SKIP_POINT" -eq 0 ]; then
         --extract_batch 64 \
         --resume
 else
-    echo "=== [4/6] Skipping OOF pointwise (--skip-oof-point) ==="
+    echo "=== [4/5] Skipping OOF pointwise (--skip-oof-point) ==="
 fi
 
-echo "=== [5/6] CLS-based pair similarity ==="
+echo "=== [4.5/5] CLS-based pair similarity ==="
 python -m stacking.features.semantic \
     --in_splits data/processed \
     --extraction_dir "$EXTRACTION_DIR"
 
-if [ "$SKIP_PAIR" -eq 0 ]; then
-    echo "=== [6/6a] OOF pairwise BERT (binary task, 30-epoch cap) ==="
-    # Warm-starts from the OOF full pointwise encoder when present. If the
-    # point-OOF was skipped (or its full/ dir was wiped), pair trains fresh
-    # from microsoft/graphcodebert-base — slightly slower convergence but
-    # still correct. Bumped from 8 to 30 epochs (v2 was undertrained at 8).
-    WARM_START_ARGS=()
-    POINT_FULL_CKPT="$EXTRACTION_DIR/oof/full/best/pytorch_model.bin"
-    if [ -f "$POINT_FULL_CKPT" ]; then
-        echo "   warm-starting from OOF point full: $EXTRACTION_DIR/oof/full/best"
-        WARM_START_ARGS=(--warm_start_from "$EXTRACTION_DIR/oof/full/best")
-    else
-        echo "   NOTE: no point-OOF full checkpoint at $POINT_FULL_CKPT"
-        echo "         → pair will train from fresh graphcodebert-base (expect slower convergence)"
-    fi
-    python -m stacking.features.oof_pair \
-        --data_dir data/processed \
-        --out_dir "$EXTRACTION_DIR" \
-        --n_folds "$N_FOLDS" \
-        --epochs 30 \
-        --batch_size 12 \
-        --grad_accum 2 \
-        --lr 1e-5 \
-        --label_smoothing 0.05 \
-        --class_weights none \
-        --bf16 \
-        --num_workers 4 \
-        --max_seq_len 512 \
-        --eval_every_steps 100 \
-        --patience 3 \
-        --extract_batch 32 \
-        "${WARM_START_ARGS[@]}" \
-        --resume
-else
-    echo "=== [6/6a] Skipping OOF pairwise (--skip-oof-pair) ==="
-    echo "   WARNING: pair logit features on pair_train will be over-confident."
-fi
-
 if [ "$SKIP_SWEEP" -eq 0 ]; then
-    echo "=== [6/6b] Head sweep (8 heads x 3 variants x 3 seeds = 72 experiments) ==="
+    echo "=== [5a/5] Head sweep (4 heads x v1 x 3 seeds = 12 experiments) ==="
     python -m stacking.sweep \
         --config stacking/configs/sweep.yaml \
         --in_splits data/processed \
         --extraction_dir "$EXTRACTION_DIR" \
         --out_dir "$OUT_ROOT"
 else
-    echo "=== [6/6b] Skipping grid sweep (--skip-sweep) ==="
+    echo "=== [5a/5] Skipping grid sweep (--skip-sweep) ==="
 fi
 
 if [ "$SKIP_HP" -eq 0 ]; then
-    echo "=== [6/6c] HP search on top heads ($HP_HEADS) x ($HP_VARIANTS), $HP_TRIALS trials each ==="
+    echo "=== [5b/5] HP search on top heads ($HP_HEADS), $HP_TRIALS trials each ==="
     # TPE + median pruner over head-specific search spaces. Best HPs re-run
     # at 3 seeds on the test set to report mean +/- std.
     python -m stacking.hp_search \
         --heads "$HP_HEADS" \
-        --variants "$HP_VARIANTS" \
         --trials "$HP_TRIALS" \
         --seeds 42,43,44 \
         --in_splits data/processed \
         --extraction_dir "$EXTRACTION_DIR" \
         --out_root "$OUT_ROOT/hp"
 else
-    echo "=== [6/6c] Skipping HP search (--skip-hp) ==="
+    echo "=== [5b/5] Skipping HP search (--skip-hp) ==="
 fi
 
 echo ""
 echo "=== DONE ==="
 echo "Grid sweep summary: $OUT_ROOT/SUMMARY.md"
 echo "HP search summary:  $OUT_ROOT/hp/HP_SUMMARY.md"
-echo "Per-experiment dirs: $OUT_ROOT/<head>-<variant>-s<seed>/"
-echo "Per-HP-cell dirs:    $OUT_ROOT/hp/<head>-<variant>/"
-echo "OOF artifacts: $EXTRACTION_DIR/oof/ (pointwise), $EXTRACTION_DIR/oof_pair/ (pairwise)"
+echo "Per-experiment dirs: $OUT_ROOT/<head>-v1-s<seed>/"
+echo "Per-HP-cell dirs:    $OUT_ROOT/hp/<head>-v1/"
+echo "OOF artifacts: $EXTRACTION_DIR/oof/ (pointwise)"

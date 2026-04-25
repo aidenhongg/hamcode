@@ -1,4 +1,4 @@
-"""Evaluation metrics for pointwise and pairwise heads.
+"""Evaluation metrics for the pointwise complexity classifier.
 
 Pointwise:
   - accuracy
@@ -6,30 +6,18 @@ Pointwise:
   - macro-F1 (primary)
   - within-1-tier accuracy (soft correct — classes have a natural order)
   - confusion matrix
-
-Pairwise (binary after the rewrite — classes: same / A_faster):
-  - accuracy
-  - binary macro-F1 (primary)
-  - confusion matrix
-
-Extras:
-  - Spearman rho reconstructed from pairwise decisions on a set of snippets
-    (sanity check that pairwise & pointwise orderings agree).
 """
 
 from __future__ import annotations
 
-from collections import defaultdict
 from typing import Iterable, Sequence
 
 import numpy as np
-from sklearn.metrics import f1_score, precision_recall_fscore_support
+from sklearn.metrics import precision_recall_fscore_support
 
 from common.labels import (
     IDX_TO_LABEL,
-    NUM_PAIR_LABELS,
     NUM_POINT_LABELS,
-    PAIR_LABELS,
     POINT_LABELS,
     TIER,
 )
@@ -66,33 +54,6 @@ def pointwise_metrics(preds: Sequence[int], labels: Sequence[int]) -> dict:
         "accuracy": acc,
         "macro_f1": macro_f1,
         "within_1_tier_accuracy": w1,
-        "per_class": per_class,
-        "confusion_matrix": cm.tolist(),
-    }
-
-
-def pairwise_metrics(preds: Sequence[int], labels: Sequence[int]) -> dict:
-    preds_a = np.asarray(preds)
-    labels_a = np.asarray(labels)
-    acc = float((preds_a == labels_a).mean()) if len(preds_a) else 0.0
-    p, r, f, s = precision_recall_fscore_support(
-        labels_a, preds_a,
-        labels=list(range(NUM_PAIR_LABELS)),
-        zero_division=0,
-    )
-    macro_f1 = float(np.mean(f)) if f.size else 0.0
-    cm = np.zeros((NUM_PAIR_LABELS, NUM_PAIR_LABELS), dtype=np.int64)
-    for t, p_ in zip(labels_a.tolist(), preds_a.tolist()):
-        cm[int(t), int(p_)] += 1
-    per_class = {
-        PAIR_LABELS[i]: {
-            "precision": float(p[i]), "recall": float(r[i]),
-            "f1": float(f[i]), "support": int(s[i]),
-        } for i in range(NUM_PAIR_LABELS)
-    }
-    return {
-        "accuracy": acc,
-        "macro_f1": macro_f1,
         "per_class": per_class,
         "confusion_matrix": cm.tolist(),
     }

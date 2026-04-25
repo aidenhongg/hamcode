@@ -1,7 +1,8 @@
 """End-to-end prediction CLI for the stacking head.
 
 Loads a trained head directory (contains scaler + head artifacts), re-extracts
-AST / BERT logits / CLS-cosine for a fresh (code_a, code_b) pair, and emits JSON.
+AST / pointwise BERT logits / CLS-cosine for a fresh (code_a, code_b) pair,
+and emits JSON.
 
 IMPORTANT: The caller is expected to submit pairs in canonical order (B
 same-or-slower than A). The head's output is:
@@ -10,11 +11,9 @@ same-or-slower than A). The head's output is:
 
 Usage:
     python -m stacking.predict_head \
-        --head_dir runs/heads/xgb-v3-s42 \
+        --head_dir runs/heads/xgb-v1-s42 \
         --point_ckpt runs/point-20260422-065105/point-20260422-065105/best \
-        --pair_ckpt  runs/pair-20260422-070049/pair-20260422-070049/best \
-        --code_a examples/linear.py \
-        --code_b examples/quadratic.py
+        --pair examples/linear.py examples/quadratic.py
 """
 
 from __future__ import annotations
@@ -35,7 +34,7 @@ from stacking.features.ast_features import (
     diff_columns, extract_differenced, extract_features,
 )
 from stacking.features.bert_logits import (
-    _encode_pair_batch, _encode_point_batch, _forward_with_cls, load_frozen_model,
+    _encode_point_batch, _forward_with_cls, load_frozen_model,
 )
 from stacking.heads.base import HeadRegistry
 
@@ -56,25 +55,15 @@ def _pointwise_features(model, tokenizer, code: str, device: torch.device,
     return logits[0].cpu().numpy(), cls[0].cpu().numpy()
 
 
-def _pairwise_logits(model, tokenizer, code_a: str, code_b: str,
-                      device: torch.device, fp16: bool,
-                      max_seq_len: int) -> np.ndarray:
-    enc = _encode_pair_batch([code_a], [code_b], tokenizer, max_seq_len)
-    logits, _ = _forward_with_cls(model, enc, device, use_fp16=fp16)
-    return logits[0].cpu().numpy()
-
-
 def predict(
     head_dir: Path,
-    point_ckpt: Path | None,
-    pair_ckpt: Path | None,
+    point_ckpt: Path,
     code_a: str,
     code_b: str,
     fp16: bool = True,
     max_seq_len: int = 512,
 ) -> dict:
     head, cfg = _head_from_dir(head_dir)
-    variant = cfg["variant"]
     scaler = ds.load_scaler(head_dir / "scaler.joblib")
     schema = json.loads((head_dir / "schema.json").read_text(encoding="utf-8"))
     expected_cols = schema["columns"]
@@ -84,61 +73,41 @@ def predict(
     # AST differenced (always)
     ast_row = extract_differenced(code_a, code_b).astype(np.float32)
 
-    # BERT parts per variant
-    point_block = None
-    pair_block = None
-
-    if variant in ("v1", "v3"):
-        if point_ckpt is None:
-            raise ValueError("point_ckpt required for variant v1/v3")
-        pmodel, ptok = load_frozen_model(point_ckpt, task="point")
-        pmodel = pmodel.to(device)
-        la, cls_a = _pointwise_features(pmodel, ptok, code_a, device, fp16, max_seq_len)
-        lb, cls_b = _pointwise_features(pmodel, ptok, code_b, device, fp16, max_seq_len)
-        diff = lb - la
-        absd = np.abs(diff)
-        point_block = np.concatenate([la, lb, diff, absd]).astype(np.float32)
-        # cls cosine
-        na = np.linalg.norm(cls_a) + 1e-12
-        nb = np.linalg.norm(cls_b) + 1e-12
-        cos = float((cls_a @ cls_b) / (na * nb))
-        l2 = float(np.linalg.norm(cls_a - cls_b))
-        mad = float(np.mean(np.abs(cls_a - cls_b)))
-        mxd = float(np.max(np.abs(cls_a - cls_b)))
-        sim_block = np.array([cos, l2, mad, mxd], dtype=np.float32)
-    else:
-        sim_block = np.zeros(4, dtype=np.float32)
-
-    if variant in ("v2", "v3"):
-        if pair_ckpt is None:
-            raise ValueError("pair_ckpt required for variant v2/v3")
-        pmodel, ptok = load_frozen_model(pair_ckpt, task="pair")
-        pmodel = pmodel.to(device)
-        pair_block = _pairwise_logits(pmodel, ptok, code_a, code_b,
-                                         device, fp16, max_seq_len).astype(np.float32)
+    # Pointwise BERT block (only variant supported is v1)
+    pmodel, ptok = load_frozen_model(point_ckpt)
+    pmodel = pmodel.to(device)
+    la, cls_a = _pointwise_features(pmodel, ptok, code_a, device, fp16, max_seq_len)
+    lb, cls_b = _pointwise_features(pmodel, ptok, code_b, device, fp16, max_seq_len)
+    diff = lb - la
+    absd = np.abs(diff)
+    point_block = np.concatenate([la, lb, diff, absd]).astype(np.float32)
+    # cls cosine
+    na = np.linalg.norm(cls_a) + 1e-12
+    nb = np.linalg.norm(cls_b) + 1e-12
+    cos = float((cls_a @ cls_b) / (na * nb))
+    l2 = float(np.linalg.norm(cls_a - cls_b))
+    mad = float(np.mean(np.abs(cls_a - cls_b)))
+    mxd = float(np.max(np.abs(cls_a - cls_b)))
+    sim_block = np.array([cos, l2, mad, mxd], dtype=np.float32)
 
     # Assemble in the same order as training, then scale
     ast_cols = diff_columns()  # 84
     feature_dict: dict[str, float] = {}
     for i, c in enumerate(ast_cols):
         feature_dict[c] = float(ast_row[i])
-    if point_block is not None:
-        for i, c in enumerate(expected_cols):
-            if c.startswith("point_A_logit_"):
-                k = int(c.rsplit("_", 1)[-1])
-                feature_dict[c] = float(point_block[k])
-            elif c.startswith("point_B_logit_"):
-                k = int(c.rsplit("_", 1)[-1])
-                feature_dict[c] = float(point_block[11 + k])
-            elif c.startswith("point_diff_logit_"):
-                k = int(c.rsplit("_", 1)[-1])
-                feature_dict[c] = float(point_block[22 + k])
-            elif c.startswith("point_abs_diff_logit_"):
-                k = int(c.rsplit("_", 1)[-1])
-                feature_dict[c] = float(point_block[33 + k])
-    if pair_block is not None:
-        for i in range(3):
-            feature_dict[f"pair_pair_logit_{i}"] = float(pair_block[i])
+    for c in expected_cols:
+        if c.startswith("point_A_logit_"):
+            k = int(c.rsplit("_", 1)[-1])
+            feature_dict[c] = float(point_block[k])
+        elif c.startswith("point_B_logit_"):
+            k = int(c.rsplit("_", 1)[-1])
+            feature_dict[c] = float(point_block[11 + k])
+        elif c.startswith("point_diff_logit_"):
+            k = int(c.rsplit("_", 1)[-1])
+            feature_dict[c] = float(point_block[22 + k])
+        elif c.startswith("point_abs_diff_logit_"):
+            k = int(c.rsplit("_", 1)[-1])
+            feature_dict[c] = float(point_block[33 + k])
     sim_names = ["cls_cosine", "cls_l2", "cls_mean_abs_diff", "cls_max_abs_diff"]
     for i, c in enumerate(sim_names):
         feature_dict[c] = float(sim_block[i])
@@ -162,7 +131,6 @@ def predict(
     proba = head.predict_proba(X)[0]
     pred = int(np.argmax(proba))
     return {
-        "variant": variant,
         "head": cfg["head"],
         "seed": cfg["seed"],
         "label": "A_faster" if pred == 1 else "same",
@@ -175,8 +143,7 @@ def predict(
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--head_dir", required=True)
-    ap.add_argument("--point_ckpt", default=None)
-    ap.add_argument("--pair_ckpt", default=None)
+    ap.add_argument("--point_ckpt", required=True)
     group = ap.add_mutually_exclusive_group(required=True)
     group.add_argument("--pair", nargs=2, metavar=("A", "B"),
                         help="Python file paths for code_a and code_b")
@@ -195,8 +162,7 @@ def main() -> int:
 
     result = predict(
         head_dir=Path(args.head_dir),
-        point_ckpt=Path(args.point_ckpt) if args.point_ckpt else None,
-        pair_ckpt=Path(args.pair_ckpt) if args.pair_ckpt else None,
+        point_ckpt=Path(args.point_ckpt),
         code_a=code_a, code_b=code_b,
         fp16=args.fp16, max_seq_len=args.max_seq_len,
     )

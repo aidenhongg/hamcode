@@ -77,10 +77,6 @@ def _run_one(head: str, variant: str, seed: int, in_splits: Path,
             "per_class_A_faster_f1": met["per_class"]["A_faster"]["f1"],
             "dir": str(exp_dir),
         }
-        if "bert_pairwise_baseline_comparison" in met:
-            b = met["bert_pairwise_baseline_comparison"]
-            row["vs_bert_delta"] = b["delta"]
-            row["mcnemar_p"] = b["mcnemar_p"]
         return row
     except Exception as e:  # fail-soft
         msg = {
@@ -118,7 +114,7 @@ def _write_summary(rows: list[dict], out_dir: Path) -> None:
             f.write("(no successful runs)\n"); return
 
         cols = ["head", "variant", "seed", "test_acc", "macro_f1", "roc_auc",
-                "brier", "ece", "vs_bert_delta", "mcnemar_p"]
+                "brier", "ece"]
         # header
         f.write("| " + " | ".join(cols) + " |\n")
         f.write("|" + "|".join("---" for _ in cols) + "|\n")
@@ -139,8 +135,7 @@ def _write_summary(rows: list[dict], out_dir: Path) -> None:
             key = (r["head"], r["variant"])
             if key not in best or r["test_acc"] > best[key]["test_acc"]:
                 best[key] = r
-        pcols = ["head", "variant", "best_seed", "test_acc", "macro_f1",
-                 "roc_auc", "vs_bert_delta", "mcnemar_p"]
+        pcols = ["head", "variant", "best_seed", "test_acc", "macro_f1", "roc_auc"]
         f.write("| " + " | ".join(pcols) + " |\n")
         f.write("|" + "|".join("---" for _ in pcols) + "|\n")
         for (head, variant), r in sorted(best.items()):
@@ -150,8 +145,6 @@ def _write_summary(rows: list[dict], out_dir: Path) -> None:
                 "test_acc": r["test_acc"],
                 "macro_f1": r["macro_f1"],
                 "roc_auc": r.get("roc_auc"),
-                "vs_bert_delta": r.get("vs_bert_delta"),
-                "mcnemar_p": r.get("mcnemar_p"),
             }
             def _fmt(k):
                 v = row.get(k)
@@ -183,7 +176,7 @@ def main() -> int:
         failures.unlink()
 
     if args.smoke:
-        cfg = SweepConfig(heads=["xgb"], variants=["v3"], seeds=[42])
+        cfg = SweepConfig(heads=["xgb"], variants=["v1"], seeds=[42])
     else:
         cfg = SweepConfig.load(Path(args.config))
 

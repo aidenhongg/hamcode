@@ -1,19 +1,18 @@
-# stacking — stacked head for pairwise complexity ranking
+# stacking — pairwise complexity head on top of frozen pointwise GraphCodeBERT
 
 Second-stage classifier on top of frozen GraphCodeBERT. Consumes pre-softmax
-logits (pointwise 11-d + **pairwise 2-d**), AST features (21 per snippet,
-differenced + |diff|), and CLS-cosine similarity; predicts the binary
-`same` vs `A_faster` label.
+pointwise logits (11-d × A and B), AST features (21 per snippet, differenced
++ |diff|), and CLS-cosine similarity; predicts the binary `same` vs
+`A_faster` label.
 
 Target deployment: **RunPod RTX 5090** (32GB VRAM, bf16, CUDA 12.8+).
 End-to-end orchestrator: `stacking/scripts/run_runpod.sh`.
 
 ## Task
 
-**The pairwise BERT head is now binary, not ternary.** The pipeline
-canonicalizes every pair so tier_A <= tier_B — given any candidate
-(a, b), if tier_a > tier_b they are swapped. After the rewrite the
-dataset contains only two classes:
+The head is binary. The pipeline canonicalizes every pair so tier_A <= tier_B
+— given any candidate (a, b), if tier_a > tier_b they are swapped. After the
+rewrite the dataset contains only two classes:
 
 - `0 = same`     — A and B are in the same complexity tier
 - `1 = A_faster` — B is strictly slower than A (i.e. f(A) ∈ o(f(B)))
@@ -23,26 +22,35 @@ Callers of head inference must submit pairs in canonical order
 enforces this at data-generation time; `stacking/dataset.filter_b_ge_a`
 remains as a defensive safety net.
 
-## Leakage fix (vs. original plan)
+## Pointwise BERT only
 
-The original recipe (`bert_logits.py --point/--pair`) reuses a pointwise
-and pairwise BERT trained on the same `train.parquet`/`pair_train.parquet`
-codes that end up inside the head's training features. Those train-split
-logits are therefore over-confident and the head overfits. The new
-default replaces both with K-fold out-of-fold (OOF) extraction:
+Pairwise BERT fine-tuning was retired. The head learns to compare two
+snippets using only:
+
+- **A's pointwise BERT logits** (11-d), **B's pointwise BERT logits** (11-d),
+  plus their `diff` and `|diff|`.
+- **AST diff features** between A and B (~84-d, derived from per-snippet
+  AST counts/booleans extracted by `stacking/features/ast_features.py`).
+- **CLS similarity** features (cosine, L2, mean/max abs diff) between A's
+  and B's BERT CLS vectors.
+
+This is the only supported variant (formerly `v1`).
+
+## Leakage fix
+
+The original recipe (`bert_logits.py`) reuses a pointwise BERT trained on the
+same `train.parquet` codes that end up inside the head's training features.
+Those train-split logits are over-confident and the head overfits. The new
+default replaces it with K-fold out-of-fold (OOF) extraction:
 
 | Module | Old (leaky) | New (OOF, default) |
 |--------|-------------|--------------------|
-| Pointwise logits + CLS | `stacking/features/bert_logits.py --point` | `stacking/features/oof_point.py` |
-| Pairwise logits | `stacking/features/bert_logits.py --pair` | `stacking/features/oof_pair.py` |
+| Pointwise logits + CLS | `stacking/features/bert_logits.py` | `stacking/features/oof_point.py` |
 
 `oof_point.py` splits train by **problem_id** (so no code's problem
 appears across folds), trains pointwise BERT K times on K-1-fold unions,
 and concatenates the held-out fold predictions into a single
 `point_logits_train.parquet`. A final full-train model covers val/test.
-
-`oof_pair.py` does the same for pair BERT, grouping pairs by a union-find
-over their code SHA256s so no code is shared across fold training sets.
 
 Legacy `bert_logits.py` remains available for quick sanity checks but its
 results should be treated as upper-bound train metrics only.
@@ -90,26 +98,23 @@ and never calls home.
 bash stacking/scripts/run_runpod.sh
 ```
 
-Runs end-to-end: data → AST → OOF pointwise → semantic → OOF pairwise →
-grid sweep (72 configs) → HP search on top heads (Optuna, 40 trials each).
+Runs end-to-end: data → AST → OOF pointwise → semantic → grid sweep
+(12 configs) → HP search on top heads (Optuna, 40 trials each).
 
 Flags (all optional):
 - `--skip-data` — dataset already built
 - `--skip-oof-point` — OOF pointwise extraction already done
-- `--skip-oof-pair` — accept pair leakage (cuts ~2.5 GPU-hours)
-- `--skip-sweep` — skip the 72-config grid (go straight to HP search)
+- `--skip-sweep` — skip the 12-config grid (go straight to HP search)
 - `--skip-hp` — skip Optuna HP search
-- `--hp-trials N` — Optuna trials per (head, variant) cell (default 40)
+- `--hp-trials N` — Optuna trials per head (default 40)
 - `--hp-heads` — csv, default `xgb,lgbm,mlp,stacked`
-- `--hp-variants` — csv, default `v1,v3` (v2 consistently loses on this task)
 - `--n_folds N` — number of OOF folds (default 5)
 
-Expected wallclock on 5090 (post epoch-bump + HP search):
+Expected wallclock on 5090:
 - OOF pointwise (40-epoch cap, 6 runs): ~2 h
-- OOF pairwise (30-epoch cap, 6 runs): ~4 h
-- Grid sweep (72 head configs): ~10 min CPU
-- HP search (4 heads x 2 variants x 40 trials): ~2-4 h CPU
-- Total: ~8-10 h
+- Grid sweep (12 head configs): ~3 min CPU
+- HP search (4 heads × 40 trials): ~2-4 h CPU
+- Total: ~4-6 h
 
 The grid sweep and HP search run on CPU so they don't contend with the BERT extraction.
 
@@ -123,14 +128,14 @@ bash run_pipeline.sh
 python -m stacking.features.ast_features \
     --in_splits data/processed --out_dir runs/heads/extraction
 
-# 3. OOF pointwise BERT (leakage-fixed, 8-epoch cap)
-#    5 folds + final full-train model = 6 pointwise training runs (~45 min on 5090)
+# 3. OOF pointwise BERT (leakage-fixed)
+#    5 folds + final full-train model = 6 pointwise training runs (~2h on 5090)
 python -m stacking.features.oof_point \
     --data_dir data/processed \
     --out_dir runs/heads/extraction \
     --n_folds 5 \
-    --epochs 8 --batch_size 16 --grad_accum 2 --lr 2e-5 --bf16 \
-    --eval_every_steps 100 --patience 2 \
+    --epochs 40 --batch_size 16 --grad_accum 2 --lr 2e-5 --bf16 \
+    --eval_every_steps 100 --patience 3 \
     --extract_batch 64 --resume
 
 # 4. CLS cosine similarity
@@ -138,29 +143,16 @@ python -m stacking.features.semantic \
     --in_splits data/processed \
     --extraction_dir runs/heads/extraction
 
-# 5. OOF pairwise BERT (binary task, 8-epoch cap)
-#    Warm-starts from the OOF pointwise full encoder for faster convergence.
-python -m stacking.features.oof_pair \
-    --data_dir data/processed \
-    --out_dir runs/heads/extraction \
-    --n_folds 5 \
-    --epochs 8 --batch_size 12 --grad_accum 2 --lr 1e-5 --bf16 \
-    --eval_every_steps 100 --patience 2 \
-    --label_smoothing 0.05 --class_weights none \
-    --warm_start_from runs/heads/extraction/oof/full/best \
-    --extract_batch 32 --resume
-
-# 6. Grid sweep — fixed HPs, 8 heads x 3 variants x 3 seeds = 72 configs (~10 min CPU)
+# 5. Grid sweep — fixed HPs, 4 heads x 1 variant x 3 seeds = 12 configs (~3 min CPU)
 python -m stacking.sweep \
     --config stacking/configs/sweep.yaml \
     --in_splits data/processed \
     --extraction_dir runs/heads/extraction \
     --out_dir runs/heads
 
-# 7. HP search — Optuna TPE on top heads (XGB/LGBM/MLP/Stacked), best seed-avg on test
+# 6. HP search — Optuna TPE on top heads, best seed-avg on test
 python -m stacking.hp_search \
     --heads xgb,lgbm,mlp,stacked \
-    --variants v1,v3 \
     --trials 40 --seeds 42,43,44 \
     --in_splits data/processed \
     --extraction_dir runs/heads/extraction \
@@ -171,11 +163,10 @@ python -m stacking.hp_search \
 
 The pipeline runs both by design:
 
-**Grid sweep** (`stacking.sweep`): fixed HPs across 8 heads x 3 variants x 3 seeds.
-Cheap comparison of heads *under the same defaults*. Tells you which head
-architecture responds best to these features out of the box.
+**Grid sweep** (`stacking.sweep`): fixed HPs across 4 heads x 1 variant x 3 seeds.
+Cheap comparison of heads *under the same defaults*.
 
-**HP search** (`stacking.hp_search`): Optuna TPE, per (head, variant). Rich search
+**HP search** (`stacking.hp_search`): Optuna TPE, per head. Rich search
 spaces — XGBoost over depth/lr/n_estimators/regularization, LightGBM similar,
 MLP over hidden_layers/hidden_dim/activation/optimizer/dropout/layer_norm,
 Stacked over base-head subset and meta choice. Pruned with MedianPruner.
@@ -184,7 +175,7 @@ Winning HPs are re-run at 3 seeds on TEST for variance bars.
 Read the grid sweep first (`runs/heads/SUMMARY.md`) for head ranking; read
 the HP search (`runs/heads/hp/HP_SUMMARY.md`) for the final best numbers.
 
-Artifacts per HP cell (`runs/heads/hp/<head>-<variant>/`):
+Artifacts per HP cell (`runs/heads/hp/<head>-v1/`):
 - `study.db` — SQLite Optuna storage (resumable across runs)
 - `best_params.json` — winning HPs + best val macro-F1
 - `trials.jsonl` — every trial's params + val metrics
@@ -195,41 +186,32 @@ Artifacts per HP cell (`runs/heads/hp/<head>-<variant>/`):
 
 All training + extraction commands respect `--resume`. Kill a run mid-way;
 rerun the same command and it picks up at the last completed fold /
-chunk. Fold outputs live at `runs/heads/extraction/oof/fold_<k>/` and
-`oof_pair/fold_<k>/`.
+chunk. Fold outputs live at `runs/heads/extraction/oof/fold_<k>/`.
 
-## BERT variants (head features)
-
-- `v1` — A + B pointwise logits with [raw A; raw B; diff; |diff|] (44 dims BERT)
-- `v2` — pairwise logit only (**2 dims** BERT after the binary rewrite)
-- `v3` — v1 + v2 combined (**46 dims** BERT)
-
-All variants also include the 84-dim AST diff block + 4-dim CLS similarity block.
-
-## Heads (8)
+## Heads (top-4)
 
 | # | Head | When it wins |
 |---|------|--------------|
 | `xgb` | XGBoost | Strong default for 50-150 dim tabular |
 | `lgbm` | LightGBM | Often faster + complementary to xgb |
 | `mlp` | 2x128 + dropout | Smooth boundary for logit/cos space |
-| `logreg` | Logistic Regression | Linear baseline (calibration sanity) |
-| `rf` | Random Forest | Uncorrelated with GBM |
-| `knn` | KNN (cosine, k=11) | Instance-based |
-| `gnb` | Gaussian NB | Naive baseline |
 | `stacked` | LogReg meta on (xgb, lgbm, mlp) probs | Final ensemble |
+
+`logreg` is registered for use as the default meta classifier inside
+`stacked`, but it is not exposed for standalone sweeping. The lower-ranked
+heads (gnb, knn, rf) were retired after the HP_SUMMARY established the
+top-4 ordering.
 
 ## Outputs
 
-Per experiment (`runs/heads/<head>-<variant>-s<seed>/`):
+Per experiment (`runs/heads/<head>-v1-s<seed>/`):
 
 ```
 config.json              -- resolved config + HPs
 scaler.joblib            -- fit on train only
 schema.json              -- column order + scaled mask
 metrics.jsonl            -- val + test metrics
-test_metrics.json        -- accuracy, macro-F1, ROC-AUC, Brier, ECE,
-                            McNemar p vs BERT baseline
+test_metrics.json        -- accuracy, macro-F1, ROC-AUC, Brier, ECE
 predictions.parquet      -- per-pair predictions for error analysis
 feature_importance.json  -- gain/coef (tree + logreg only)
 confusion_matrix.png
@@ -239,7 +221,7 @@ head/                    -- saved head artifact(s)
 
 Aggregate (`runs/heads/SUMMARY.md` + `SUMMARY.csv`):
 - All experiments ranked by test_acc
-- Best-seed pivot per (head, variant)
+- Best-seed pivot per head
 - Failures logged to `runs/heads/_failures.jsonl` (sweep is fail-soft)
 
 OOF intermediates:
@@ -248,21 +230,16 @@ runs/heads/extraction/oof/
   splits/                -- per-fold train/heldout parquets
   fold_00/ .. fold_04/   -- per-fold pointwise run directories (train.log + best/)
   full/                  -- final full-train pointwise model
-runs/heads/extraction/oof_pair/
-  splits/
-  fold_00/ .. fold_04/   -- per-fold pair run directories
-  full/                  -- final full-train pair model
 ```
 
 ## Head-only inference
 
-Once a winning config is selected (say `xgb v3 seed 42`):
+Once a winning config is selected (say `xgb v1 seed 42`):
 
 ```bash
 python -m stacking.predict_head \
-    --head_dir runs/heads/xgb-v3-s42 \
+    --head_dir runs/heads/xgb-v1-s42 \
     --point_ckpt runs/heads/extraction/oof/full/best \
-    --pair_ckpt  runs/heads/extraction/oof_pair/full/best \
     --pair examples/linear.py examples/quadratic.py
 ```
 
@@ -275,12 +252,12 @@ with `label` (same / A_faster), `prob_same`, `prob_A_faster`.
 python -m pytest stacking/tests/ -v
 ```
 
-47 unit tests cover AST extractor correctness, head fit/predict/save/load
+Unit tests cover AST extractor correctness, head fit/predict/save/load
 round-trips, dataset filter + label construction, imbalance detection,
 reproducibility under same seed, class-weight effect on minority recall.
 The OOF drivers are currently covered by subprocess-level integration
 (the underlying `train.py` is already battle-tested); unit tests for fold
-disjointness live in `tests/test_oof_folds.py` (see below).
+disjointness live in `tests/test_oof_folds.py`.
 
 ## Known limitations
 
@@ -288,10 +265,3 @@ disjointness live in `tests/test_oof_folds.py` (see below).
   (`a→b→a`) is not caught (~5% miss rate in typical corpora).
 - **`no_of_switches`** counts Python 3.10+ `match` statements only. Still
   near-zero in practice; tree heads ignore it.
-- **Pair BERT warm-start**: by default each OOF pair fold warm-starts from
-  the OOF pointwise full encoder. That encoder saw all train codes, so
-  there's residual encoder-level leakage into pair fold training. It is
-  bounded (the classifier head is fresh per fold) but non-zero. A fully
-  clean run would warm-start pair fold `k` from pointwise fold `k`; this
-  is deferred as TODO — the expected gain is small relative to the 5x
-  cost of fold-aligned warm starts.

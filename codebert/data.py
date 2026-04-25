@@ -1,4 +1,4 @@
-"""Dataset + collator for GraphCodeBERT complexity classification.
+"""Dataset + collator for GraphCodeBERT pointwise complexity classification.
 
 This is where the DFG magic happens. For each code string we:
   1) Parse with tree-sitter-python.
@@ -7,8 +7,6 @@ This is where the DFG magic happens. For each code string we:
      tracking a mapping from source-token index -> BPE span.
   4) Build the final sequence:
          [CLS] <code BPE tokens> [SEP] <DFG variable tokens> <PAD ...>
-     plus, for --pair, we splice two snippets separated by [SEP] and keep
-     each snippet's DFG as a disjoint graph subregion.
   5) Build:
          input_ids        [max_seq]
          position_ids     [max_seq]    (code: 2..; DFG: 0; pad: 1)
@@ -43,9 +41,7 @@ from torch.utils.data import Dataset
 from common.dfg_cache import DFGCache
 from common.labels import (
     LABEL_TO_IDX,
-    NUM_PAIR_LABELS,
     NUM_POINT_LABELS,
-    PAIR_LABEL_TO_IDX,
 )
 
 # -----------------------------------------------------------------------------
@@ -271,119 +267,6 @@ def build_point_inputs(
     )
 
 
-def build_pair_inputs(
-    code_a: str,
-    code_b: str,
-    tokenizer,
-    max_seq_len: int = 512,
-    max_dfg_nodes_total: int = 64,
-) -> InputBundle:
-    """Build a cross-encoder bundle: [CLS] A [SEP] B [SEP] DFG_A DFG_B [PAD]."""
-    cls, sep, pad, unk, pad_id = _special_ids(tokenizer)
-
-    per_dfg = max_dfg_nodes_total // 2
-    # Each side's code budget ≈ (seq_len - 3 special - 2*per_dfg) / 2
-    max_code_each = (max_seq_len - 3 - max_dfg_nodes_total) // 2
-
-    def _prep(code: str):
-        raw_tokens, dfg = extract_dataflow(code)
-        flat, spans = _tokenize_with_mapping(raw_tokens, tokenizer)
-        if len(flat) > max_code_each:
-            flat = flat[:max_code_each]
-            spans = [(a, b) for (a, b) in spans if b <= max_code_each]
-        dfg = _keep_valid_dfg(dfg, len(spans))[:per_dfg]
-        return flat, spans, dfg
-
-    flat_a, spans_a, dfg_a = _prep(code_a)
-    flat_b, spans_b, dfg_b = _prep(code_b)
-
-    # Assemble ids: [CLS] flat_a [SEP] flat_b [SEP] dfg_a dfg_b [PAD...]
-    ids = (
-        [cls]
-        + tokenizer.convert_tokens_to_ids(flat_a)
-        + [sep]
-        + tokenizer.convert_tokens_to_ids(flat_b)
-        + [sep]
-        + [unk] * len(dfg_a)
-        + [unk] * len(dfg_b)
-    )
-    pad_len = max_seq_len - len(ids)
-    if pad_len < 0:
-        ids = ids[:max_seq_len]; pad_len = 0
-    ids = ids + [pad_id] * pad_len
-
-    # Index offsets
-    cls_idx = 0
-    flat_a_start = 1                       # right after CLS
-    flat_a_end = flat_a_start + len(flat_a)
-    sep1_idx = flat_a_end
-    flat_b_start = sep1_idx + 1
-    flat_b_end = flat_b_start + len(flat_b)
-    sep2_idx = flat_b_end
-    dfg_a_start = sep2_idx + 1
-    dfg_a_end = dfg_a_start + len(dfg_a)
-    dfg_b_start = dfg_a_end
-    dfg_b_end = dfg_b_start + len(dfg_b)
-    code_end = sep2_idx + 1  # CLS..SEP2 inclusive region
-    total_used = dfg_b_end
-
-    # position_ids:
-    #   CLS & flat_a: pad_id+1, pad_id+2, ...
-    #   [SEP] after A: continues
-    #   flat_b: restarts at pad_id+1+offset? Upstream uses a single continuous
-    #     numbering — we follow that (matches RoBERTa's usual behavior; the
-    #     model was pretrained with one sequence). This keeps inference simple.
-    pos: list[int] = []
-    for i in range(code_end):
-        pos.append(pad_id + 1 + i)
-    pos.extend([0] * (len(dfg_a) + len(dfg_b)))
-    pos.extend([pad_id] * pad_len)
-    pos = pos[:max_seq_len]
-
-    # attention mask [seq, seq]
-    seq = max_seq_len
-    attn = np.zeros((seq, seq), dtype=bool)
-
-    # Code-to-code attention: split into two disjoint blocks so A's code doesn't
-    # attend to B's DFG (and vice versa). We DO allow A-code <-> B-code at the
-    # transformer level — that's the whole point of a cross-encoder.
-    attn[:code_end, :code_end] = True
-
-    # DFG-A connections
-    var_a: dict[int, int] = {}
-    for j, d in enumerate(dfg_a):
-        src_idx = d[1]
-        if 0 <= src_idx < len(spans_a):
-            span_s, span_e = spans_a[src_idx]
-            attn[dfg_a_start + j, flat_a_start + span_s : flat_a_start + span_e] = True
-            attn[flat_a_start + span_s : flat_a_start + span_e, dfg_a_start + j] = True
-        var_a[src_idx] = j
-    for j, d in enumerate(dfg_a):
-        for src in d[4]:
-            if src in var_a:
-                attn[dfg_a_start + j, dfg_a_start + var_a[src]] = True
-
-    # DFG-B connections (disjoint from DFG-A — no cross-snippet edges)
-    var_b: dict[int, int] = {}
-    for j, d in enumerate(dfg_b):
-        src_idx = d[1]
-        if 0 <= src_idx < len(spans_b):
-            span_s, span_e = spans_b[src_idx]
-            attn[dfg_b_start + j, flat_b_start + span_s : flat_b_start + span_e] = True
-            attn[flat_b_start + span_s : flat_b_start + span_e, dfg_b_start + j] = True
-        var_b[src_idx] = j
-    for j, d in enumerate(dfg_b):
-        for src in d[4]:
-            if src in var_b:
-                attn[dfg_b_start + j, dfg_b_start + var_b[src]] = True
-
-    return InputBundle(
-        input_ids=np.asarray(ids, dtype=np.int64),
-        position_ids=np.asarray(pos, dtype=np.int64),
-        attention_mask=attn,
-    )
-
-
 def _special_ids(tokenizer) -> tuple[int, int, int, int, int]:
     cls = tokenizer.cls_token_id
     sep = tokenizer.sep_token_id
@@ -463,73 +346,6 @@ class PointDataset(Dataset):
             b = build_point_inputs(code, self.tokenizer, self.max_seq_len, self.max_dfg_nodes)
             try:
                 self.cache.put(code + "|" + key, b)
-            except OSError:
-                pass
-        return {
-            "input_ids": torch.from_numpy(b.input_ids),
-            "position_ids": torch.from_numpy(b.position_ids),
-            "attention_mask": torch.from_numpy(b.attention_mask).to(torch.bool),
-            "labels": torch.tensor(label_idx, dtype=torch.long),
-        }
-
-
-class PairDataset(Dataset):
-    """Loads a pairwise parquet."""
-
-    def __init__(
-        self,
-        parquet_path: str | Path,
-        tokenizer,
-        max_seq_len: int = 512,
-        max_dfg_nodes: int = 64,
-        cache_dir: str | None = None,
-        use_dfg: bool = False,
-    ) -> None:
-        super().__init__()
-        self.table = pq.read_table(parquet_path)
-        self.tokenizer = tokenizer
-        self.max_seq_len = max_seq_len
-        self.max_dfg_nodes = max_dfg_nodes
-        self.use_dfg = use_dfg
-        self.cache = (DFGCache(cache_dir) if cache_dir is not None else DFGCache()) if use_dfg else None
-        self._a = self.table.column("code_a").to_pylist()
-        self._b = self.table.column("code_b").to_pylist()
-        self._t = self.table.column("ternary").to_pylist()
-        self._ids = self.table.column("pair_id").to_pylist()
-
-    def __len__(self) -> int:
-        return len(self._a)
-
-    def __getitem__(self, i: int) -> dict[str, torch.Tensor]:
-        label_idx = PAIR_LABEL_TO_IDX[self._t[i]]
-
-        if not self.use_dfg:
-            enc = self.tokenizer(
-                self._a[i], self._b[i],                # HF handles [CLS] A [SEP] B [SEP]
-                truncation="longest_first",
-                padding="max_length",
-                max_length=self.max_seq_len,
-                return_tensors="pt",
-            )
-            return {
-                "input_ids": enc["input_ids"][0],
-                "attention_mask": enc["attention_mask"][0],
-                "position_ids": torch.arange(self.max_seq_len, dtype=torch.long),
-                "labels": torch.tensor(label_idx, dtype=torch.long),
-            }
-
-        key = f"pair:{self.max_seq_len}:{self.max_dfg_nodes}"
-        cache_key = (self._a[i] + "\n---\n" + self._b[i]) + "|" + key
-        cached = self.cache.get(cache_key)
-        if cached is not None:
-            b: InputBundle = cached
-        else:
-            b = build_pair_inputs(
-                self._a[i], self._b[i],
-                self.tokenizer, self.max_seq_len, self.max_dfg_nodes,
-            )
-            try:
-                self.cache.put(cache_key, b)
             except OSError:
                 pass
         return {

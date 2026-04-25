@@ -1,4 +1,5 @@
-"""Single source of truth for complexity labels, tiers, and pairwise classes."""
+"""Single source of truth for complexity labels, ordinal tiers, and the
+binary pair-label derivation used by head training data generation."""
 
 from __future__ import annotations
 
@@ -21,8 +22,8 @@ NUM_POINT_LABELS = len(POINT_LABELS)
 LABEL_TO_IDX: dict[str, int] = {lab: i for i, lab in enumerate(POINT_LABELS)}
 IDX_TO_LABEL: dict[int, str] = {i: lab for i, lab in enumerate(POINT_LABELS)}
 
-# Ordinal tier for pairwise ranking. Assumes m ≈ n for multi-var.
-# Equal tier -> "same".
+# Ordinal tier mapping (used by within-1-tier accuracy). Assumes m ≈ n for
+# multi-variable classes. Equal tier => same complexity bucket.
 TIER: dict[str, int] = {
     "O(1)": 0,
     "O(log n)": 1,
@@ -38,15 +39,13 @@ TIER: dict[str, int] = {
 }
 assert set(TIER) == set(POINT_LABELS), "TIER must cover all 11 classes"
 
-# Binary pairwise labels. The pair task is restricted to the B-same-or-slower
-# subset (tier_B >= tier_A). Within that subset only two outcomes are possible:
-#   - "same"      : tier_A == tier_B  (A and B share complexity tier)
-#   - "A_faster"  : tier_A <  tier_B  (A is strictly faster, i.e. B strictly slower)
-# Pairs with tier_A > tier_B are rejected upstream (pipeline/10_make_pairwise.py
-# canonicalizes by swapping so every emitted pair satisfies tier_A <= tier_B).
-# Stable order — PAIR_LABELS[i] is the label for class index i.
+# Binary pair labels emitted by `pipeline/10_make_pairwise.py` and consumed by
+# the stacking heads (which classify pairs as same / A_faster). Pairs with
+# tier_A > tier_B are canonicalized via swap upstream so only two outcomes
+# survive into the head training data.
+#   - "same"      : tier_A == tier_B
+#   - "A_faster"  : tier_A <  tier_B
 PAIR_LABELS: tuple[str, ...] = ("same", "A_faster")
-NUM_PAIR_LABELS = len(PAIR_LABELS)
 PAIR_LABEL_TO_IDX: dict[str, int] = {lab: i for i, lab in enumerate(PAIR_LABELS)}
 
 
