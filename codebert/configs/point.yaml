@@ -1,15 +1,14 @@
-task: point
-model_name: microsoft/graphcodebert-base
+model_name: microsoft/longcoder-base
 
-# Sequence / DFG
-max_seq_len: 512
-max_dfg_nodes: 64
+# Sequence
+max_seq_len: 4096
+bridge_stride: 128
 
-# Optimization
-batch_size: 16
-grad_accum: 2
+# Optimization (5090 / 32GB VRAM at seq_len 4096)
+batch_size: 2
+grad_accum: 16
 lr: 2.0e-5
-warmup_ratio: 0.1
+warmup_ratio: 0.15
 weight_decay: 0.01
 epochs: 50              # generous upper bound; patience is the real stopper
 label_smoothing: 0.0

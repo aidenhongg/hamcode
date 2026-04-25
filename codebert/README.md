@@ -1,7 +1,8 @@
-# codebert — GraphCodeBERT pointwise complexity classifier
+# codebert — LongCoder pointwise complexity classifier
 
-Fine-tunes [microsoft/graphcodebert-base](https://huggingface.co/microsoft/graphcodebert-base)
-for Python time-complexity classification (pointwise, 11-class).
+Fine-tunes [microsoft/longcoder-base](https://huggingface.co/microsoft/longcoder-base)
+for Python time-complexity classification (pointwise, 11-class). 4096-token
+context with bridge + memory tokens; last-token pooling for the classifier.
 
 ```bash
 python train.py --data_dir data/processed
@@ -102,11 +103,10 @@ CodeComplex auto-fetch tries several URLs; if none reach, drop the jsonl at
 ```
 train.py           # CLI: pointwise training
 predict.py         # inference CLI
-data.py            # PointDataset + DFG-aware collator
-model.py           # GraphCodeBERT + classification head
+data.py            # PointDataset + LongCodeEncoder (bridge + memory tokens)
+model.py           # LongCoder (Longformer) + classification head
 metrics.py         # pointwise metrics + confusion matrix
-common/            # labels, schemas, normalizer, DFG cache
-parser/            # vendored microsoft/CodeBERT parser (MIT)
+common/            # labels, schemas, normalizer
 pipeline/          # 01-11 data scripts (DAG-ordered by numeric prefix)
 configs/           # point.yaml (CLI overrides them)
 data/raw/          # cloned repos + downloaded jsonl
@@ -116,7 +116,3 @@ runs/              # checkpoints (best/ + last/)
 stacking/          # second-stage classifiers (xgb/lgbm/mlp/stacked) on top of frozen BERT logits
 ```
 
-## License
-
-This project vendors `parser/DFG.py` and `parser/utils.py` from
-[microsoft/CodeBERT](https://github.com/microsoft/CodeBERT) under the MIT License.

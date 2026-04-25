@@ -39,9 +39,9 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Kill transformers' background safetensors-conversion thread.
 # Root cause: transformers spawns Thread-auto_conversion that HEAD-requests
-# model.safetensors on every open PR ref (refs/pr/N). For
-# microsoft/graphcodebert-base, PR #8 is an orphan LFS safetensors conversion
-# whose redirects hang indefinitely. This blocks training on network I/O.
+# model.safetensors on every open PR ref (refs/pr/N). For models that ship
+# only pytorch_model.bin (microsoft/longcoder-base does), PR-ref LFS redirects
+# can hang indefinitely and block training on network I/O.
 #
 # - DISABLE_SAFETENSORS_CONVERSION=1 short-circuits the thread entirely
 #   (see transformers/modeling_utils.py:_get_resolved_checkpoint_files,
@@ -54,23 +54,27 @@ export DISABLE_SAFETENSORS_CONVERSION=1
 export HF_HUB_DOWNLOAD_TIMEOUT=30
 
 SKIP_DATA=0
-SKIP_POINT=0
-SKIP_SWEEP=0
-SKIP_HP=0
+SKIP_ENCODER_SWEEP=0
+SKIP_HEAD_HP=0
+SKIP_LORA_HP=0
 HP_TRIALS=40
 HP_HEADS="xgb,lgbm,mlp,stacked"
+LORA_HP_TRIALS=16
 N_FOLDS=5
+ENCODER_CONFIG="stacking/configs/encoder_sweep.yaml"
 EXTRACTION_DIR="runs/heads/extraction"
 OUT_ROOT="runs/heads"
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --skip-data) SKIP_DATA=1 ;;
-        --skip-oof-point) SKIP_POINT=1 ;;
-        --skip-sweep) SKIP_SWEEP=1 ;;
-        --skip-hp) SKIP_HP=1 ;;
+        --skip-encoder-sweep) SKIP_ENCODER_SWEEP=1 ;;
+        --skip-head-hp) SKIP_HEAD_HP=1 ;;
+        --skip-lora-hp) SKIP_LORA_HP=1 ;;
         --hp-trials) HP_TRIALS="$2"; shift ;;
         --hp-heads) HP_HEADS="$2"; shift ;;
+        --lora-hp-trials) LORA_HP_TRIALS="$2"; shift ;;
+        --encoder-config) ENCODER_CONFIG="$2"; shift ;;
         --n_folds) N_FOLDS="$2"; shift ;;
         --extraction_dir) EXTRACTION_DIR="$2"; shift ;;
         --out_root) OUT_ROOT="$2"; shift ;;
@@ -94,14 +98,14 @@ fi
 echo "=== [0.5/5] GPU + transformers sanity (still ONLINE for pre-download) ==="
 python -c "import torch; assert torch.cuda.is_available(), 'no CUDA'; print('GPU:', torch.cuda.get_device_name(0), 'torch:', torch.__version__, 'bf16:', torch.cuda.is_bf16_supported())"
 
-echo "=== [1/5] Pre-download microsoft/graphcodebert-base from main (no PR refs) ==="
+echo "=== [1/5] Pre-download microsoft/longcoder-base from main (no PR refs) ==="
 # snapshot_download walks repo_id@revision and fetches only the allow-listed
 # files. It never falls through to PR refs — that fallback is strictly a
 # transformers.from_pretrained behaviour, not huggingface_hub's.
 python -c "
 from huggingface_hub import snapshot_download
 p = snapshot_download(
-    'microsoft/graphcodebert-base',
+    'microsoft/longcoder-base',
     revision='main',
     allow_patterns=[
         'config.json',
@@ -123,9 +127,9 @@ export TRANSFORMERS_OFFLINE=1
 
 echo "=== [1.5/5] Offline-mode smoke: load encoder from cache only ==="
 python -c "
-from transformers import AutoModel, AutoTokenizer
-_t = AutoTokenizer.from_pretrained('microsoft/graphcodebert-base')
-_m = AutoModel.from_pretrained('microsoft/graphcodebert-base')
+from transformers import AutoTokenizer, LongformerModel
+_t = AutoTokenizer.from_pretrained('microsoft/longcoder-base')
+_m = LongformerModel.from_pretrained('microsoft/longcoder-base')
 print('encoder + tokenizer load OK from cache (offline)')
 "
 
@@ -141,47 +145,29 @@ python -m stacking.features.ast_features \
     --in_splits data/processed \
     --out_dir "$EXTRACTION_DIR"
 
-if [ "$SKIP_POINT" -eq 0 ]; then
-    echo "=== [4/5] OOF pointwise BERT (leakage fix, 40-epoch cap) ==="
-    # Tuned for 5090 / 32GB VRAM. Generous epoch cap — patience=3 stops most
-    # folds at ~15-20 epochs.
-    python -m stacking.features.oof_point \
+if [ "$SKIP_ENCODER_SWEEP" -eq 0 ]; then
+    echo "=== [4/6] Encoder recipe sweep (recipes A + B from $ENCODER_CONFIG) ==="
+    # Iterates each recipe: (optional cache prewarm) -> OOF -> semantic -> head sweep.
+    # Resume-aware: recipes whose <out_root>/<recipe>/SUMMARY.md exists are skipped.
+    python -m stacking.encoder_sweep \
+        --config "$ENCODER_CONFIG" \
         --data_dir data/processed \
-        --out_dir "$EXTRACTION_DIR" \
-        --n_folds "$N_FOLDS" \
-        --epochs 40 \
-        --batch_size 16 \
-        --grad_accum 2 \
-        --lr 2e-5 \
-        --bf16 \
-        --num_workers 4 \
-        --max_seq_len 512 \
-        --eval_every_steps 100 \
-        --patience 3 \
-        --extract_batch 64 \
-        --resume
+        --out_root "$OUT_ROOT" \
+        --extraction_root "$EXTRACTION_DIR"
 else
-    echo "=== [4/5] Skipping OOF pointwise (--skip-oof-point) ==="
+    echo "=== [4/6] Skipping encoder sweep (--skip-encoder-sweep) ==="
 fi
 
-echo "=== [4.5/5] CLS-based pair similarity ==="
-python -m stacking.features.semantic \
-    --in_splits data/processed \
-    --extraction_dir "$EXTRACTION_DIR"
-
-if [ "$SKIP_SWEEP" -eq 0 ]; then
-    echo "=== [5a/5] Head sweep (4 heads x v1 x 3 seeds = 12 experiments) ==="
-    python -m stacking.sweep \
-        --config stacking/configs/sweep.yaml \
-        --in_splits data/processed \
-        --extraction_dir "$EXTRACTION_DIR" \
-        --out_dir "$OUT_ROOT"
-else
-    echo "=== [5a/5] Skipping grid sweep (--skip-sweep) ==="
+WINNER_FILE="$OUT_ROOT/ENCODER_WINNER.json"
+if [ ! -f "$WINNER_FILE" ]; then
+    echo "[runpod] no $WINNER_FILE produced; aborting before HP search" >&2
+    exit 1
 fi
+WINNER=$(python -c "import json; print(json.load(open('$WINNER_FILE'))['name'])")
+echo "[runpod] winner: $WINNER"
 
-if [ "$SKIP_HP" -eq 0 ]; then
-    echo "=== [5b/5] HP search on top heads ($HP_HEADS), $HP_TRIALS trials each ==="
+if [ "$SKIP_HEAD_HP" -eq 0 ]; then
+    echo "=== [5/6] Head HP search on winner ($WINNER), $HP_TRIALS trials per head ==="
     # TPE + median pruner over head-specific search spaces. Best HPs re-run
     # at 3 seeds on the test set to report mean +/- std.
     python -m stacking.hp_search \
@@ -189,16 +175,29 @@ if [ "$SKIP_HP" -eq 0 ]; then
         --trials "$HP_TRIALS" \
         --seeds 42,43,44 \
         --in_splits data/processed \
-        --extraction_dir "$EXTRACTION_DIR" \
-        --out_root "$OUT_ROOT/hp"
+        --extraction_dir "$EXTRACTION_DIR/$WINNER" \
+        --out_root "$OUT_ROOT/$WINNER/hp"
 else
-    echo "=== [5b/5] Skipping HP search (--skip-hp) ==="
+    echo "=== [5/6] Skipping head HP search (--skip-head-hp) ==="
+fi
+
+if [ "$SKIP_LORA_HP" -eq 0 ]; then
+    echo "=== [6/6] LoRA HP search on winner ($WINNER), $LORA_HP_TRIALS trials ==="
+    python -m stacking.lora_hp_search \
+        --config "$ENCODER_CONFIG" \
+        --base_recipe "$WINNER" \
+        --data_dir data/processed \
+        --out_root "$OUT_ROOT/lora_hp" \
+        --trials "$LORA_HP_TRIALS"
+else
+    echo "=== [6/6] Skipping LoRA HP search (--skip-lora-hp) ==="
 fi
 
 echo ""
 echo "=== DONE ==="
-echo "Grid sweep summary: $OUT_ROOT/SUMMARY.md"
-echo "HP search summary:  $OUT_ROOT/hp/HP_SUMMARY.md"
-echo "Per-experiment dirs: $OUT_ROOT/<head>-v1-s<seed>/"
-echo "Per-HP-cell dirs:    $OUT_ROOT/hp/<head>-v1/"
-echo "OOF artifacts: $EXTRACTION_DIR/oof/ (pointwise)"
+echo "Encoder sweep:    $OUT_ROOT/ENCODER_SUMMARY.md"
+echo "Encoder winner:   $OUT_ROOT/ENCODER_WINNER.json -> $WINNER"
+echo "Per-recipe heads: $OUT_ROOT/<recipe>/SUMMARY.md"
+echo "Head HP search:   $OUT_ROOT/$WINNER/hp/HP_SUMMARY.md"
+echo "LoRA HP search:   $OUT_ROOT/lora_hp/$WINNER/best_params.json"
+echo "OOF artifacts:    $EXTRACTION_DIR/<recipe>/oof/"

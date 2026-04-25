@@ -123,8 +123,8 @@ def main() -> int:
                 "ternary": label,        # column kept named 'ternary' for schema
                                          # compatibility; values are binary now.
                 "same_problem": same_prob,
-                "tokens_combined": int(a.get("tokens_graphcodebert") or 0)
-                                   + int(b.get("tokens_graphcodebert") or 0),
+                "tokens_combined": int(a.get("tokens_bpe") or 0)
+                                   + int(b.get("tokens_bpe") or 0),
                 "split": sp,
             })
             pair_idx += 1

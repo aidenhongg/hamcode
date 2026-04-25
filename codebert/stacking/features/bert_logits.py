@@ -1,19 +1,23 @@
-"""Extract frozen pointwise BERT pre-softmax logits (+ CLS vectors) for
+"""Extract frozen pointwise LongCoder pre-softmax logits (+ pooled vectors) for
 downstream stacking.
 
-Loads a pointwise checkpoint and extracts 11-d logits + 768-d CLS per code.
-Uses fp16 autocast on CUDA (RTX 2070 compatible — sm_75, no bf16) and falls
-back to fp32 on CPU. Writes incrementally to parquet so that a killed process
-can be resumed: already-written code SHA256s are skipped on restart.
+Loads a pointwise checkpoint and extracts 11-d logits + 768-d pooled
+last-token representation per code. Uses bf16 autocast on Ampere/Ada/Hopper/
+Blackwell, fp16 on Turing, fp32 on CPU. Writes incrementally to parquet so a
+killed process can be resumed: already-written ids are skipped on restart.
 
 Does NOT fine-tune. The model's state_dict is loaded read-only.
+
+The "cls_*" parquet columns are kept for naming-stability with downstream
+readers (semantic.py, dataset.py); the values are LongCoder's pooled
+last-token hidden state, not a [CLS] vector.
 
 CLI:
     python -m stacking.features.bert_logits \
         --ckpt runs/point-20260422-065105/point-20260422-065105/best \
         --in_splits data/processed \
         --out_dir runs/heads/extraction \
-        --batch 8 --fp16
+        --batch 4 --fp16
 """
 
 from __future__ import annotations
@@ -44,11 +48,12 @@ except Exception:
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from model import GraphCodeBERTClassifier
+from data import build_point_inputs
+from model import LongCoderClassifier
 
 
 # -----------------------------------------------------------------------------
-# SHA256 helper — matches common/dfg_cache.py keying
+# SHA256 helper
 # -----------------------------------------------------------------------------
 
 def code_sha(code: str) -> str:
@@ -59,16 +64,21 @@ def code_sha(code: str) -> str:
 # Model loading (frozen)
 # -----------------------------------------------------------------------------
 
-def load_frozen_model(ckpt_dir: str | Path) -> tuple[GraphCodeBERTClassifier, "AutoTokenizer"]:
-    """Load a pointwise GraphCodeBERTClassifier checkpoint in eval + no-grad mode."""
+def load_frozen_model(ckpt_dir: str | Path) -> tuple[LongCoderClassifier, "AutoTokenizer"]:
+    """Load a pointwise LongCoderClassifier checkpoint in eval + no-grad mode.
+
+    For LoRA checkpoints we merge the adapter into the base weights so the
+    extraction forward pays no per-step LoRA matmul cost.
+    """
     p = Path(ckpt_dir)
-    if not (p / "pytorch_model.bin").exists():
+    has_full = (p / "pytorch_model.bin").exists()
+    has_adapter = (p / "adapter").exists()
+    if not (has_full or has_adapter):
         raise FileNotFoundError(
-            f"No pytorch_model.bin at {p}. Either the checkpoint was not synced to this "
-            f"machine or the path is wrong. Expected layout: <ckpt>/pytorch_model.bin + "
-            f"<ckpt>/codebert_meta.json"
+            f"No checkpoint at {p}. Expected either pytorch_model.bin (full FT) "
+            f"or adapter/ + classifier.pt (LoRA), plus codebert_meta.json."
         )
-    model = GraphCodeBERTClassifier.load_checkpoint(p)
+    model = LongCoderClassifier.load_checkpoint(p, merge_lora=True)
     model.eval()
     for pm in model.parameters():
         pm.requires_grad_(False)
@@ -77,17 +87,27 @@ def load_frozen_model(ckpt_dir: str | Path) -> tuple[GraphCodeBERTClassifier, "A
 
 
 # -----------------------------------------------------------------------------
-# Inference — simple path (no DFG), matches existing predict.py when use_dfg=False
+# Inference — LongCoder bundles (bridge + memory tokens, global attention)
 # -----------------------------------------------------------------------------
 
-def _encode_point_batch(codes: list[str], tokenizer, max_seq_len: int) -> dict:
-    return tokenizer(
-        codes,
-        truncation=True,
-        padding="max_length",
-        max_length=max_seq_len,
-        return_tensors="pt",
-    )
+def _encode_point_batch(
+    codes: list[str],
+    tokenizer,
+    max_seq_len: int,
+    bridge_stride: int = 128,
+) -> dict:
+    bundles = [
+        build_point_inputs(c, tokenizer, max_seq_len, bridge_stride)
+        for c in codes
+    ]
+    return {
+        "input_ids": torch.from_numpy(np.stack([b.input_ids for b in bundles])),
+        "attention_mask": torch.from_numpy(np.stack([b.attention_mask for b in bundles])),
+        "global_attention_mask": torch.from_numpy(
+            np.stack([b.global_attention_mask for b in bundles])
+        ),
+        "token_type_ids": torch.from_numpy(np.stack([b.token_type_ids for b in bundles])),
+    }
 
 
 def _autocast_dtype(device: torch.device, use_amp: bool) -> "torch.dtype | None":
@@ -106,34 +126,37 @@ def _autocast_dtype(device: torch.device, use_amp: bool) -> "torch.dtype | None"
 
 @torch.no_grad()
 def _forward_with_cls(model, enc, device, use_fp16: bool) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run the encoder; return (logits, cls_vec). cls_vec shape (B, hidden).
+    """Run the encoder; return (logits, pooled_vec). pooled_vec shape (B, hidden).
 
-    `use_fp16` is a legacy name for "use autocast mixed precision on CUDA".
-    The actual dtype is chosen by `_autocast_dtype` (bf16 preferred when available).
+    Always uses the full-forward path. Extraction-time LoRA checkpoints have
+    already been merge_and_unload'd in load_frozen_model so this stays branch
+    free.
     """
     input_ids = enc["input_ids"].to(device, non_blocking=True)
     attn = enc["attention_mask"].to(device, non_blocking=True)
-    pos = torch.arange(input_ids.shape[1], device=device).unsqueeze(0).expand_as(input_ids)
+    g_attn = enc["global_attention_mask"].to(device, non_blocking=True)
+    types = enc["token_type_ids"].to(device, non_blocking=True)
 
     dtype = _autocast_dtype(device, use_amp=use_fp16)
 
-    if dtype is not None:
-        with torch.autocast(device_type="cuda", dtype=dtype):
-            enc_out = model.encoder(
-                input_ids=input_ids, attention_mask=attn, position_ids=pos,
-                return_dict=True,
-            )
-            cls = enc_out.last_hidden_state[:, 0, :]
-            logits = model.classifier(model.dropout(cls))
-    else:
+    def _run() -> tuple[torch.Tensor, torch.Tensor]:
+        from model import _last_token_pool
         enc_out = model.encoder(
-            input_ids=input_ids, attention_mask=attn, position_ids=pos,
+            input_ids=input_ids,
+            attention_mask=attn,
+            global_attention_mask=g_attn,
+            token_type_ids=types,
             return_dict=True,
         )
-        cls = enc_out.last_hidden_state[:, 0, :]
-        logits = model.classifier(model.dropout(cls))
-    # Cast back to fp32 for stable downstream arithmetic.
-    return logits.float(), cls.float()
+        pooled = _last_token_pool(enc_out.last_hidden_state, attn)
+        return model.classifier(model.dropout(pooled)), pooled
+
+    if dtype is not None:
+        with torch.autocast(device_type="cuda", dtype=dtype):
+            logits, pooled = _run()
+    else:
+        logits, pooled = _run()
+    return logits.float(), pooled.float()
 
 
 # -----------------------------------------------------------------------------
@@ -203,8 +226,9 @@ def extract_point(
     ckpt_dir: Path,
     in_splits: Path,
     out_dir: Path,
-    max_seq_len: int = 512,
-    batch_size: int = 64,
+    max_seq_len: int = 4096,
+    bridge_stride: int = 128,
+    batch_size: int = 4,
     fp16: bool = True,
     device: str | None = None,
     also_cls: bool = True,
@@ -218,7 +242,7 @@ def extract_point(
     model = model.to(dev)
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    hidden = int(model.encoder.config.hidden_size)
+    hidden = int(model._base_longformer.config.hidden_size)
     n_labels = int(model.num_labels)
 
     for sp in ("train", "val", "test"):
@@ -250,7 +274,7 @@ def extract_point(
         for start in tqdm(range(0, len(todo), batch_size), desc=f"point:{sp}"):
             chunk = todo[start:start + batch_size]
             _, batch_ids, batch_codes = zip(*chunk)
-            enc = _encode_point_batch(list(batch_codes), tokenizer, max_seq_len)
+            enc = _encode_point_batch(list(batch_codes), tokenizer, max_seq_len, bridge_stride)
             try:
                 logits, cls_vec = _forward_with_cls(model, enc, dev, use_fp16=fp16)
             except torch.cuda.OutOfMemoryError:
@@ -293,6 +317,7 @@ def extract_point(
         "num_labels": n_labels,
         "hidden_size": hidden,
         "max_seq_len": max_seq_len,
+        "bridge_stride": bridge_stride,
     }, indent=2), encoding="utf-8")
 
 
@@ -306,10 +331,11 @@ def main() -> int:
                     help="path to pointwise checkpoint directory with pytorch_model.bin")
     ap.add_argument("--in_splits", default="data/processed")
     ap.add_argument("--out_dir", default="runs/heads/extraction")
-    ap.add_argument("--max_seq_len", type=int, default=512)
-    ap.add_argument("--batch", type=int, default=64,
-                    help="Default 64 (tuned for RTX 5090 / 32GB VRAM). "
-                         "Halve for 2070-class 8GB cards; quarter on CPU.")
+    ap.add_argument("--max_seq_len", type=int, default=4096)
+    ap.add_argument("--bridge_stride", type=int, default=128)
+    ap.add_argument("--batch", type=int, default=4,
+                    help="Default 4 (tuned for RTX 5090 / 32GB VRAM at 4096 seq). "
+                         "Halve for tighter VRAM budgets; quarter on CPU.")
     ap.add_argument("--fp16", action="store_true", default=True,
                     help="Enable CUDA autocast (bf16 if the GPU supports it, else fp16). "
                          "Ignored on CPU. Default on.")
@@ -325,6 +351,7 @@ def main() -> int:
         in_splits=Path(args.in_splits),
         out_dir=Path(args.out_dir),
         max_seq_len=args.max_seq_len,
+        bridge_stride=args.bridge_stride,
         batch_size=args.batch,
         fp16=args.fp16,
         device=args.device,

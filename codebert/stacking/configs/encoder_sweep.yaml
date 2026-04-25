@@ -1,0 +1,53 @@
+# Encoder-recipe sweep driven by stacking/encoder_sweep.py.
+#
+# Each recipe runs:
+#   1. (optional) cache_activations.py  — populate the frozen-prefix activation cache
+#   2. oof_point.py                     — 5 OOF folds + 1 full-train pointwise
+#   3. semantic.py                      — pair similarity from pooled vectors
+#   4. stacking.sweep                   — head grid (xgb / lgbm / mlp / stacked × seeds)
+#
+# After all recipes finish, encoder_sweep.py writes
+# runs/heads/ENCODER_SUMMARY.md with the best test macro-F1 per recipe and
+# picks a winner for HP search.
+
+defaults: &defaults
+  epochs: 40
+  batch_size: 4
+  grad_accum: 8
+  num_workers: 4
+  max_seq_len: 4096
+  bridge_stride: 128
+  eval_every_steps: 100
+  patience: 3
+  bf16: true
+  extract_batch: 4
+  lr: 1.0e-4               # LoRA-recommended; full-FT (if added) should override to 2e-5
+
+recipes:
+  # Experiment A — LoRA on Q+V (regular + global) of all 12 layers.
+  - name: lora-r16-all
+    <<: *defaults
+    lora: true
+    lora_r: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    lora_target_modules: query,value,query_global,value_global
+    lora_freeze_depth: 0
+    activation_cache: false
+    note: "LoRA on Q+V + global-Q+V across all 12 layers (~1.2M trainable)."
+
+  # Experiment B — LoRA on top 6, bottom 6 fully frozen, frozen-prefix activations cached.
+  - name: lora-r16-top6-cached
+    <<: *defaults
+    lora: true
+    lora_r: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    lora_target_modules: query,value,query_global,value_global
+    lora_freeze_depth: 6
+    activation_cache: true
+    note: "LoRA on Q+V + global-Q+V of top 6 layers; bottom 6 cached on disk."
+
+# Head sweep used after each recipe's OOF; same as stacking/configs/sweep.yaml.
+head_sweep:
+  config: stacking/configs/sweep.yaml

@@ -10,10 +10,11 @@
 # exploding (operator torchvision::nms does not exist):
 #   pip uninstall -y torchvision torchaudio
 torch>=2.7.0
-transformers>=4.45.0
+transformers>=4.45.0,<5.0.0
 accelerate>=1.0.0
 datasets>=2.20.0
 safetensors>=0.4.5
+peft>=0.10.0
 
 # Tokenization / parsing
 tree_sitter==0.21.3

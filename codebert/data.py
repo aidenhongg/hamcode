@@ -1,17 +1,26 @@
-"""Dataset + collator for GraphCodeBERT pointwise complexity classification.
+"""Dataset + LongCoder input encoder for pointwise complexity classification.
 
-This is where the DFG magic happens. For each code string we:
-  1) Parse with tree-sitter-python.
-  2) Extract DFG edges via vendored parser/DFG.py.
-  3) Tokenize each source-level token with the GraphCodeBERT BPE tokenizer,
-     tracking a mapping from source-token index -> BPE span.
-  4) Build the final sequence:
-         [CLS] <code BPE tokens> [SEP] <DFG variable tokens> <PAD ...>
-  5) Build:
-         input_ids        [max_seq]
-         position_ids     [max_seq]    (code: 2..; DFG: 0; pad: 1)
-         attention_mask   [max_seq, max_seq]   (3D graph-guided)
-  6) Cache the whole bundle keyed by code SHA256 so tree-sitter runs once.
+For each Python snippet we build an encoder-friendly bundle:
+  1) Tokenize the source with the LongCoder BPE.
+  2) Locate `import` / `def` / `class` statements via tree-sitter; the
+     newline BPE that ends each such statement becomes a memory token.
+  3) Insert bridge tokens at uniform stride throughout the sequence.
+     Bridges are global summary slots; together with memory tokens they
+     form the global-attention set that LongCoder routes long-range
+     information through.
+  4) Pack into fixed-shape tensors:
+        input_ids               [seq]
+        attention_mask          [seq]   1 on real tokens, 0 on pad
+        global_attention_mask   [seq]   1 on bridge + memory + last-token
+        token_type_ids          [seq]   0 normal, 1 bridge, 2 memory
+
+We cache the full bundle keyed by (code_sha, encoder_config_hash) so
+tree-sitter runs once per snippet across runs.
+
+For LoRA recipes that fully freeze the bottom K transformer layers, we
+optionally also serve a per-sample frozen-prefix activation (output of
+layer K-1). That cache is populated by cache_activations.py and read here
+when ActivationCacheConfig is passed to PointDataset.
 """
 
 from __future__ import annotations
@@ -21,11 +30,8 @@ import os
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Callable
 
-# AST on LeetCode code occasionally triggers Py3.12 invalid-escape warnings.
-# The tokenizer fires a "too long" warning per over-budget sample. Both are
-# expected and handled downstream — suppress so training logs stay readable.
 warnings.filterwarnings("ignore", category=SyntaxWarning)
 try:
     import transformers.utils.logging as _hf_log  # type: ignore
@@ -38,41 +44,36 @@ import pyarrow.parquet as pq
 import torch
 from torch.utils.data import Dataset
 
-from common.dfg_cache import DFGCache
-from common.labels import (
-    LABEL_TO_IDX,
-    NUM_POINT_LABELS,
-)
+from common.labels import LABEL_TO_IDX, NUM_POINT_LABELS
+
+TOKEN_TYPE_NORMAL = 0
+TOKEN_TYPE_BRIDGE = 1
+TOKEN_TYPE_MEMORY = 2
+
 
 # -----------------------------------------------------------------------------
-# tree-sitter + parser
+# tree-sitter — only used to find import/def/class statement boundaries
 # -----------------------------------------------------------------------------
 
 def _make_parser():
-    """Try several ways to get a tree-sitter Python parser."""
     try:
-        from tree_sitter_languages import get_parser  # prebuilt binary bundle
+        from tree_sitter_languages import get_parser
         return get_parser("python")
     except Exception:
         pass
-    try:
-        from tree_sitter import Language, Parser
-        import tree_sitter_python as tsp
-        parser = Parser()
-        lang = Language(tsp.language())
-        if hasattr(parser, "set_language"):
-            parser.set_language(lang)
-        else:  # tree_sitter >= 0.22 style
-            parser.language = lang
-        return parser
-    except Exception as e:
-        raise RuntimeError(
-            "Cannot load tree-sitter-python. Install `tree_sitter_languages` "
-            "or `tree_sitter_python` plus `tree_sitter`."
-        ) from e
+    from tree_sitter import Language, Parser
+    import tree_sitter_python as tsp
+    parser = Parser()
+    lang = Language(tsp.language())
+    if hasattr(parser, "set_language"):
+        parser.set_language(lang)
+    else:
+        parser.language = lang
+    return parser
 
 
 _PY_PARSER = None
+
 
 def get_python_parser():
     global _PY_PARSER
@@ -81,208 +82,274 @@ def get_python_parser():
     return _PY_PARSER
 
 
-# -----------------------------------------------------------------------------
-# DFG extraction (closely adapted from microsoft/CodeBERT run.py)
-# -----------------------------------------------------------------------------
-
-_PARSER_SYMBOLS = None
-
-def _parser_symbols():
-    global _PARSER_SYMBOLS
-    if _PARSER_SYMBOLS is None:
-        from parser import (
-            DFG_python,
-            index_to_code_token,
-            remove_comments_and_docstrings,
-            tree_to_token_index,
-        )
-        _PARSER_SYMBOLS = (DFG_python, index_to_code_token,
-                           remove_comments_and_docstrings, tree_to_token_index)
-    return _PARSER_SYMBOLS
+_MEMORY_NODE_KINDS = {
+    "import_statement",
+    "import_from_statement",
+    "future_import_statement",
+    "function_definition",
+    "class_definition",
+    "decorated_definition",
+}
 
 
-def extract_dataflow(code: str) -> tuple[list[str], list[tuple]]:
-    """Return (code_tokens, dfg_edges).
+def _memory_line_offsets(code: str) -> list[int]:
+    """Byte offsets of the `\\n` that ends each import/def/class statement.
 
-    code_tokens: list of source-level leaf tokens (identifier / literal / punct).
-    dfg_edges:   list of (var_name, idx, edge_type, source_vars, source_indices).
-                 `idx` indexes into code_tokens.
+    Falls back to an empty list on parse failure — memory-token marking is a
+    soft signal, the model still trains without it.
     """
-    parser = get_python_parser()
-    DFG_python, index_to_code_token, remove_comments_and_docstrings, tree_to_token_index = _parser_symbols()
     try:
-        clean = remove_comments_and_docstrings(code, "python")
+        tree = get_python_parser().parse(bytes(code, "utf-8"))
     except Exception:
-        clean = code
-    try:
-        tree = parser.parse(bytes(clean, "utf-8"))
-        root = tree.root_node
-        indices = tree_to_token_index(root)
-        lines = clean.split("\n")
-        code_tokens = [index_to_code_token(x, lines) for x in indices]
-        index_to_code: dict[tuple, tuple[int, str]] = {}
-        for idx, (pos, tok) in enumerate(zip(indices, code_tokens)):
-            index_to_code[pos] = (idx, tok)
-        try:
-            dfg, _ = DFG_python(root, index_to_code, {})
-        except Exception:
-            dfg = []
-        dfg = sorted(dfg, key=lambda x: x[1])
-        used: set[int] = set()
-        for d in dfg:
-            if len(d[-1]) != 0:
-                used.add(d[1])
-            for x in d[-1]:
-                used.add(x)
-        dfg = [d for d in dfg if d[1] in used]
-        return code_tokens, dfg
-    except Exception:
-        return [], []
+        return []
+    code_b = code.encode("utf-8")
+    n = len(code_b)
+    out: list[int] = []
+
+    def visit(node) -> None:
+        if node.type in _MEMORY_NODE_KINDS:
+            end = node.end_byte
+            if 0 < end <= n and code_b[end - 1:end] == b"\n":
+                out.append(end - 1)
+            else:
+                nl = code_b.find(b"\n", end)
+                if nl != -1:
+                    out.append(nl)
+            return
+        for child in node.children:
+            visit(child)
+
+    visit(tree.root_node)
+    out = sorted(set(out))
+    return out
 
 
 # -----------------------------------------------------------------------------
-# Tokenization + mapping from source-token index to BPE span
-# -----------------------------------------------------------------------------
-
-def _tokenize_with_mapping(
-    code_tokens: list[str], tokenizer
-) -> tuple[list[str], list[tuple[int, int]]]:
-    """Tokenize each source token; return flat BPE tokens + per-source-token spans.
-
-    Uses the "@" trick from GraphCodeBERT: prepend "@" and drop first piece so
-    subword tokens get the space-prefix Ġ consistently even without leading
-    whitespace.
-    """
-    flat: list[str] = []
-    spans: list[tuple[int, int]] = []
-    for i, tok in enumerate(code_tokens):
-        if i == 0:
-            sub = tokenizer.tokenize(tok) if tok else []
-        else:
-            sub = tokenizer.tokenize("@" + tok)[1:] if tok else []
-        start = len(flat)
-        flat.extend(sub)
-        spans.append((start, len(flat)))
-    return flat, spans
-
-
-# -----------------------------------------------------------------------------
-# Input bundle builder — the core thing
+# Input bundle builder
 # -----------------------------------------------------------------------------
 
 @dataclass
 class InputBundle:
-    input_ids: np.ndarray        # [seq]
-    position_ids: np.ndarray     # [seq]
-    attention_mask: np.ndarray   # [seq, seq]  (bool)
+    input_ids: np.ndarray              # [seq]
+    attention_mask: np.ndarray         # [seq]
+    global_attention_mask: np.ndarray  # [seq]
+    token_type_ids: np.ndarray         # [seq]
+
+
+def _bridge_token_id(tokenizer) -> int:
+    """LongCoder doesn't ship a dedicated bridge id; use the unk id as the
+    placeholder and let `token_type_ids=BRIDGE` route it through LongCoder's
+    bridge-specific Q/K/V projections."""
+    return tokenizer.unk_token_id
+
+
+def _memory_token_id(tokenizer) -> int:
+    """Same convention as bridges — the per-type Q/K/V projections do the
+    real work; the literal id is a placeholder."""
+    return tokenizer.unk_token_id
 
 
 def build_point_inputs(
     code: str,
     tokenizer,
-    max_seq_len: int = 512,
-    max_dfg_nodes: int = 64,
+    max_seq_len: int = 4096,
+    bridge_stride: int = 128,
 ) -> InputBundle:
-    """Build a single-snippet bundle for --point."""
-    cls, sep, pad, unk, pad_id = _special_ids(tokenizer)
+    cls_id = tokenizer.cls_token_id
+    sep_id = tokenizer.sep_token_id
+    pad_id = tokenizer.pad_token_id
+    bridge_id = _bridge_token_id(tokenizer)
+    memory_id = _memory_token_id(tokenizer)
 
-    raw_tokens, dfg = extract_dataflow(code)
-    flat, spans = _tokenize_with_mapping(raw_tokens, tokenizer)
+    enc = tokenizer(
+        code,
+        add_special_tokens=False,
+        return_offsets_mapping=True,
+        truncation=False,
+    )
+    code_ids: list[int] = list(enc["input_ids"])
+    offsets: list[tuple[int, int]] = list(enc["offset_mapping"])
 
-    # Budget: CLS + code + SEP + DFG nodes
-    # Reserve 2 special tokens; leave the rest split between code and DFG.
-    max_code = max_seq_len - 2 - max_dfg_nodes
-    if max_code < 32:
-        max_code = 32  # defensive; tiny
+    mem_byte_offsets = _memory_line_offsets(code)
+    mem_token_indices: set[int] = set()
+    if mem_byte_offsets:
+        offset_set = set(mem_byte_offsets)
+        for i, (a, b) in enumerate(offsets):
+            if a in offset_set or (b - 1) in offset_set:
+                mem_token_indices.add(i)
 
-    # Truncate code tokens (respecting source-token spans when possible).
-    if len(flat) > max_code:
-        flat = flat[:max_code]
-        # drop spans that fall outside the new code region
-        spans = [(a, b) for (a, b) in spans if b <= max_code]
+    ids: list[int] = [cls_id]
+    types: list[int] = [TOKEN_TYPE_NORMAL]
+    globals_: list[int] = [0]
 
-    # Cap DFG by available slots and by max_dfg_nodes.
-    dfg_budget = min(max_dfg_nodes, max_seq_len - 2 - len(flat))
-    dfg = _keep_valid_dfg(dfg, len(spans))[:dfg_budget]
+    stride = max(1, int(bridge_stride))
+    for i, tid in enumerate(code_ids):
+        if stride and i > 0 and i % stride == 0:
+            ids.append(bridge_id)
+            types.append(TOKEN_TYPE_BRIDGE)
+            globals_.append(1)
+        if i in mem_token_indices:
+            ids.append(memory_id)
+            types.append(TOKEN_TYPE_MEMORY)
+            globals_.append(1)
+            ids.append(tid)
+            types.append(TOKEN_TYPE_NORMAL)
+            globals_.append(0)
+        else:
+            ids.append(tid)
+            types.append(TOKEN_TYPE_NORMAL)
+            globals_.append(0)
 
-    # Assemble: [CLS] flat [SEP] dfg_vars [PAD...]
-    code_part = [cls] + tokenizer.convert_tokens_to_ids(flat) + [sep]
-    # DFG tokens: use UNK as the placeholder id (like upstream).
-    dfg_part = [unk] * len(dfg)
-    used = len(code_part) + len(dfg_part)
-    pad_len = max_seq_len - used
-    input_ids = code_part + dfg_part + [pad_id] * pad_len
-    input_ids = input_ids[:max_seq_len]
+    if len(ids) > max_seq_len - 1:
+        ids = ids[: max_seq_len - 1]
+        types = types[: max_seq_len - 1]
+        globals_ = globals_[: max_seq_len - 1]
 
-    # position_ids
-    position_ids: list[int] = []
-    # [CLS] and code tokens use positions starting at pad_id + 1
-    # (RoBERTa convention — pad is 1, so code starts at 2). [CLS] is token 0 effectively,
-    # but we follow upstream: give CLS position 2 too (start + 0).
-    for i in range(len(code_part)):
-        position_ids.append(pad_id + 1 + i)  # 2, 3, 4, ...
-    position_ids.extend([0] * len(dfg_part))           # DFG: UNK_POS
-    position_ids.extend([pad_id] * pad_len)            # padding
-    position_ids = position_ids[:max_seq_len]
+    ids.append(sep_id)
+    types.append(TOKEN_TYPE_NORMAL)
+    globals_.append(1)
 
-    # attention mask [seq, seq]
-    seq = max_seq_len
-    attn = np.zeros((seq, seq), dtype=bool)
+    real_len = len(ids)
+    pad_len = max_seq_len - real_len
+    if pad_len > 0:
+        ids.extend([pad_id] * pad_len)
+        types.extend([TOKEN_TYPE_NORMAL] * pad_len)
+        globals_.extend([0] * pad_len)
 
-    # indices
-    n_code = len(code_part)              # [CLS] ... [SEP]
-    n_dfg = len(dfg_part)
-    code_start, code_end = 0, n_code     # [CLS] is at 0
-    dfg_start = n_code
-
-    # 1) Code tokens attend to all code tokens (full within code)
-    attn[code_start:code_end, code_start:code_end] = True
-
-    # 2) DFG-to-code: each DFG node attends to the code tokens of its variable
-    #    occurrence. Var's source index = dfg[k][1]; find its BPE span.
-    var_indexd: dict[int, int] = {}   # src_token_idx -> dfg_order
-    for j, d in enumerate(dfg):
-        src_idx = d[1]
-        # +1 for [CLS] at position 0 pushing code tokens to +1
-        if 0 <= src_idx < len(spans):
-            span_start, span_end = spans[src_idx]
-            attn[dfg_start + j, 1 + span_start : 1 + span_end] = True
-            attn[1 + span_start : 1 + span_end, dfg_start + j] = True  # bidir
-        var_indexd[src_idx] = j
-
-    # 3) DFG-to-DFG: edge exists iff DFG_j's source_indices includes DFG_k's source_idx
-    for j, d in enumerate(dfg):
-        for src in d[4]:
-            if src in var_indexd:
-                attn[dfg_start + j, dfg_start + var_indexd[src]] = True
-
-    # 4) CLS row already True within code block (above). Good.
-
-    # 5) Padding rows/cols stay 0 by construction.
+    attention = [1] * real_len + [0] * pad_len
 
     return InputBundle(
-        input_ids=np.asarray(input_ids, dtype=np.int64),
-        position_ids=np.asarray(position_ids, dtype=np.int64),
-        attention_mask=attn,
+        input_ids=np.asarray(ids, dtype=np.int64),
+        attention_mask=np.asarray(attention, dtype=np.int64),
+        global_attention_mask=np.asarray(globals_, dtype=np.int64),
+        token_type_ids=np.asarray(types, dtype=np.int64),
     )
 
 
-def _special_ids(tokenizer) -> tuple[int, int, int, int, int]:
-    cls = tokenizer.cls_token_id
-    sep = tokenizer.sep_token_id
-    pad = tokenizer.pad_token_id
-    unk = tokenizer.unk_token_id
-    pad_id = tokenizer.pad_token_id
-    return cls, sep, pad, unk, pad_id
+# -----------------------------------------------------------------------------
+# Bundle cache (keyed by code + encoder config)
+# -----------------------------------------------------------------------------
+
+class _BundleCache:
+    def __init__(self, root: str | os.PathLike | None = None) -> None:
+        if root is None:
+            root = Path.home() / ".cache" / "codebert" / "longcoder"
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _key(code: str, cfg: str) -> str:
+        return hashlib.sha256((cfg + "|" + code).encode("utf-8")).hexdigest()
+
+    def _path(self, key: str) -> Path:
+        return self.root / key[:2] / f"{key}.npz"
+
+    def get(self, code: str, cfg: str) -> InputBundle | None:
+        p = self._path(self._key(code, cfg))
+        if not p.exists():
+            return None
+        try:
+            with np.load(p) as z:
+                return InputBundle(
+                    input_ids=z["input_ids"],
+                    attention_mask=z["attention_mask"],
+                    global_attention_mask=z["global_attention_mask"],
+                    token_type_ids=z["token_type_ids"],
+                )
+        except Exception:
+            return None
+
+    def put(self, code: str, cfg: str, b: InputBundle) -> None:
+        p = self._path(self._key(code, cfg))
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp.npz")
+        try:
+            np.savez(
+                tmp,
+                input_ids=b.input_ids,
+                attention_mask=b.attention_mask,
+                global_attention_mask=b.global_attention_mask,
+                token_type_ids=b.token_type_ids,
+            )
+            os.replace(tmp, p)
+        except Exception:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
-def _keep_valid_dfg(dfg: list[tuple], n_src_tokens: int) -> list[tuple]:
-    # Drop edges whose source index falls outside the (truncated) code region.
-    out = []
-    for d in dfg:
-        if 0 <= d[1] < n_src_tokens and all(0 <= s < n_src_tokens for s in d[4]):
-            out.append(d)
-    return out
+# -----------------------------------------------------------------------------
+# Frozen-activation cache (Stage 7 / recipe B)
+# -----------------------------------------------------------------------------
+
+@dataclass
+class ActivationCacheConfig:
+    """Identifies a frozen-prefix activation cache shard.
+
+    The cache is keyed on (model_name, freeze_depth, max_seq_len, bridge_stride)
+    plus the code sha. It is populated by cache_activations.py and consumed
+    read-only at training time. Population is responsibility of the user;
+    PointDataset raises a clear KeyError if a sample is missing.
+    """
+    model_name: str
+    freeze_depth: int
+    cache_dir: str | None = None
+
+    def cache_key(self, max_seq_len: int, bridge_stride: int) -> str:
+        return f"act:{self.model_name}:{self.freeze_depth}:{max_seq_len}:{bridge_stride}"
+
+
+def cached_hidden_to_torch(arr: np.ndarray) -> torch.Tensor:
+    """Inverse of cache_activations._to_numpy.
+
+    bf16 is stored as uint16 with the same byte pattern (numpy can't natively
+    represent bfloat16). Detect by dtype and view back. fp16/fp32 are stored
+    natively.
+    """
+    if arr.dtype == np.uint16:
+        return torch.from_numpy(arr).view(torch.bfloat16)
+    return torch.from_numpy(arr)
+
+
+class _FrozenActivationCache:
+    def __init__(self, root: str | os.PathLike | None = None) -> None:
+        if root is None:
+            root = Path.home() / ".cache" / "codebert" / "longcoder_act"
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _hash(code: str, cfg: str) -> str:
+        return hashlib.sha256((cfg + "|" + code).encode("utf-8")).hexdigest()
+
+    def _path(self, key: str) -> Path:
+        return self.root / key[:2] / f"{key}.npy"
+
+    def has(self, code: str, cfg: str) -> bool:
+        return self._path(self._hash(code, cfg)).exists()
+
+    def get(self, code: str, cfg: str) -> np.ndarray | None:
+        p = self._path(self._hash(code, cfg))
+        if not p.exists():
+            return None
+        try:
+            return np.load(p)
+        except Exception:
+            return None
+
+    def put(self, code: str, cfg: str, hidden: np.ndarray) -> None:
+        p = self._path(self._hash(code, cfg))
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp.npy")
+        try:
+            np.save(tmp, hidden, allow_pickle=False)
+            os.replace(tmp, p)
+        except Exception:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 # -----------------------------------------------------------------------------
@@ -290,31 +357,32 @@ def _keep_valid_dfg(dfg: list[tuple], n_src_tokens: int) -> list[tuple]:
 # -----------------------------------------------------------------------------
 
 class PointDataset(Dataset):
-    """Loads a pointwise parquet. Defaults to simple 1D tokenization (no DFG).
-
-    Pass `use_dfg=True` to enable the tree-sitter + 2D-mask path. Simple mode
-    is ~10x faster per sample and needs no prewarming.
-    """
-
     def __init__(
         self,
         parquet_path: str | Path,
         tokenizer,
-        max_seq_len: int = 512,
-        max_dfg_nodes: int = 64,
+        max_seq_len: int = 4096,
+        bridge_stride: int = 128,
         cache_dir: str | None = None,
-        use_dfg: bool = False,
+        activation_cache: ActivationCacheConfig | None = None,
     ) -> None:
         super().__init__()
         self.table = pq.read_table(parquet_path)
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
-        self.max_dfg_nodes = max_dfg_nodes
-        self.use_dfg = use_dfg
-        self.cache = (DFGCache(cache_dir) if cache_dir is not None else DFGCache()) if use_dfg else None
+        self.bridge_stride = bridge_stride
+        self.cache = _BundleCache(cache_dir) if cache_dir is not None else _BundleCache()
+        self.cache_cfg = f"v2:{max_seq_len}:{bridge_stride}"
         self._codes = self.table.column("code").to_pylist()
         self._labels = self.table.column("label").to_pylist()
         self._ids = self.table.column("id").to_pylist()
+
+        self.act_cfg = activation_cache
+        self.act_cache: _FrozenActivationCache | None = None
+        self.act_key: str | None = None
+        if activation_cache is not None:
+            self.act_cache = _FrozenActivationCache(activation_cache.cache_dir)
+            self.act_key = activation_cache.cache_key(max_seq_len, bridge_stride)
 
     def __len__(self) -> int:
         return len(self._codes)
@@ -323,48 +391,55 @@ class PointDataset(Dataset):
         code = self._codes[i]
         label_idx = LABEL_TO_IDX[self._labels[i]]
 
-        if not self.use_dfg:
-            enc = self.tokenizer(
+        bundle = self.cache.get(code, self.cache_cfg)
+        if bundle is None:
+            bundle = build_point_inputs(
                 code,
-                truncation=True,
-                padding="max_length",
-                max_length=self.max_seq_len,
-                return_tensors="pt",
+                self.tokenizer,
+                self.max_seq_len,
+                self.bridge_stride,
             )
-            return {
-                "input_ids": enc["input_ids"][0],
-                "attention_mask": enc["attention_mask"][0],            # 1D — standard
-                "position_ids": torch.arange(self.max_seq_len, dtype=torch.long),
-                "labels": torch.tensor(label_idx, dtype=torch.long),
-            }
-
-        key = f"point:{self.max_seq_len}:{self.max_dfg_nodes}"
-        cached = self.cache.get(code + "|" + key)
-        if cached is not None:
-            b: InputBundle = cached
-        else:
-            b = build_point_inputs(code, self.tokenizer, self.max_seq_len, self.max_dfg_nodes)
             try:
-                self.cache.put(code + "|" + key, b)
+                self.cache.put(code, self.cache_cfg, bundle)
             except OSError:
                 pass
-        return {
-            "input_ids": torch.from_numpy(b.input_ids),
-            "position_ids": torch.from_numpy(b.position_ids),
-            "attention_mask": torch.from_numpy(b.attention_mask).to(torch.bool),
+
+        item = {
+            "attention_mask": torch.from_numpy(bundle.attention_mask),
+            "global_attention_mask": torch.from_numpy(bundle.global_attention_mask),
             "labels": torch.tensor(label_idx, dtype=torch.long),
         }
 
+        if self.act_cache is not None:
+            assert self.act_key is not None
+            hidden = self.act_cache.get(code, self.act_key)
+            if hidden is None:
+                raise KeyError(
+                    f"activation cache miss for code id={self._ids[i]}; "
+                    f"cache key={self.act_key}. Run cache_activations.py to "
+                    f"populate before training."
+                )
+            item["cached_hidden"] = cached_hidden_to_torch(hidden)
+        else:
+            item["input_ids"] = torch.from_numpy(bundle.input_ids)
+            item["token_type_ids"] = torch.from_numpy(bundle.token_type_ids)
+
+        return item
+
 
 def make_collator() -> Callable[[list[dict]], dict[str, torch.Tensor]]:
-    """All items are already fixed-shape; just stack."""
     def collate(batch: list[dict]) -> dict[str, torch.Tensor]:
-        return {
-            "input_ids": torch.stack([b["input_ids"] for b in batch], dim=0),
-            "position_ids": torch.stack([b["position_ids"] for b in batch], dim=0),
+        out = {
             "attention_mask": torch.stack([b["attention_mask"] for b in batch], dim=0),
+            "global_attention_mask": torch.stack([b["global_attention_mask"] for b in batch], dim=0),
             "labels": torch.stack([b["labels"] for b in batch], dim=0),
         }
+        if "cached_hidden" in batch[0]:
+            out["cached_hidden"] = torch.stack([b["cached_hidden"] for b in batch], dim=0)
+        else:
+            out["input_ids"] = torch.stack([b["input_ids"] for b in batch], dim=0)
+            out["token_type_ids"] = torch.stack([b["token_type_ids"] for b in batch], dim=0)
+        return out
     return collate
 
 
@@ -373,17 +448,14 @@ def make_collator() -> Callable[[list[dict]], dict[str, torch.Tensor]]:
 # -----------------------------------------------------------------------------
 
 def compute_class_weights(parquet_path: str | Path) -> list[float]:
-    """w_c ∝ sqrt(N_total / N_c), normalized to mean 1."""
     table = pq.read_table(parquet_path)
     labels = table.column("label").to_pylist()
     counts = np.zeros(NUM_POINT_LABELS, dtype=np.float64)
     for lab in labels:
         counts[LABEL_TO_IDX[lab]] += 1
     total = counts.sum()
-    # Avoid divide-by-zero for missing classes.
     safe = np.where(counts > 0, counts, 1.0)
     w = np.sqrt(total / safe)
     w = w / w.mean()
-    # Zero out classes that have no samples so their loss contribution is 0.
     w[counts == 0] = 0.0
     return w.tolist()

@@ -1,8 +1,8 @@
-# stacking — pairwise complexity head on top of frozen pointwise GraphCodeBERT
+# stacking — pairwise complexity head on top of frozen pointwise LongCoder
 
-Second-stage classifier on top of frozen GraphCodeBERT. Consumes pre-softmax
+Second-stage classifier on top of frozen LongCoder. Consumes pre-softmax
 pointwise logits (11-d × A and B), AST features (21 per snippet, differenced
-+ |diff|), and CLS-cosine similarity; predicts the binary `same` vs
++ |diff|), and pooled-vector cosine similarity; predicts the binary `same` vs
 `A_faster` label.
 
 Target deployment: **RunPod RTX 5090** (32GB VRAM, bf16, CUDA 12.8+).
@@ -22,17 +22,19 @@ Callers of head inference must submit pairs in canonical order
 enforces this at data-generation time; `stacking/dataset.filter_b_ge_a`
 remains as a defensive safety net.
 
-## Pointwise BERT only
+## Pointwise encoder only
 
-Pairwise BERT fine-tuning was retired. The head learns to compare two
+Pairwise encoder fine-tuning was retired. The head learns to compare two
 snippets using only:
 
-- **A's pointwise BERT logits** (11-d), **B's pointwise BERT logits** (11-d),
-  plus their `diff` and `|diff|`.
+- **A's pointwise LongCoder logits** (11-d), **B's pointwise LongCoder logits**
+  (11-d), plus their `diff` and `|diff|`.
 - **AST diff features** between A and B (~84-d, derived from per-snippet
   AST counts/booleans extracted by `stacking/features/ast_features.py`).
-- **CLS similarity** features (cosine, L2, mean/max abs diff) between A's
-  and B's BERT CLS vectors.
+- **Pooled-vector similarity** features (cosine, L2, mean/max abs diff)
+  between A's and B's last-token pooled hidden states. The parquet column
+  names retain the `cls_*` prefix for naming-stability with downstream
+  readers — values are LongCoder pooled vectors, not [CLS] activations.
 
 This is the only supported variant (formerly `v1`).
 
@@ -75,14 +77,14 @@ every time, so you can skip it here if you prefer one-shot execution.
 
 ## Why the runpod script sets DISABLE_SAFETENSORS_CONVERSION=1
 
-`microsoft/graphcodebert-base`'s `main` branch only ships `pytorch_model.bin`.
+`microsoft/longcoder-base`'s `main` branch only ships `pytorch_model.bin`.
 For every such repo, `transformers.modeling_utils._get_resolved_checkpoint_files`
 launches a **background thread** (`Thread-auto_conversion`) that walks every
-open PR ref (`refs/pr/N`) looking for a safetensors conversion. PR #8 of this
-model is exactly such a conversion, but its LFS redirects hang indefinitely —
-the thread runs alongside training, holds network sockets, and blocks the
-main process on I/O. `use_safetensors=False` does NOT gate that thread; it
-only affects the main-thread file-preference logic.
+open PR ref (`refs/pr/N`) looking for a safetensors conversion. Any orphan
+LFS-backed conversion PR can hang the redirect indefinitely — the thread runs
+alongside training, holds network sockets, and blocks the main process on
+I/O. `use_safetensors=False` does NOT gate that thread; it only affects the
+main-thread file-preference logic.
 
 The only real kill switches (from the `can_auto_convert` gate in transformers):
 `DISABLE_SAFETENSORS_CONVERSION=1`, or `TRANSFORMERS_OFFLINE=1` /

@@ -1,4 +1,4 @@
-"""Inference CLI for the pointwise GraphCodeBERT complexity classifier.
+"""Inference CLI for the pointwise LongCoder complexity classifier.
 
 Usage:
     python predict.py --model_dir runs/point-v1/best --input examples/two_sum.py
@@ -22,24 +22,29 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from common.labels import IDX_TO_LABEL
 from data import build_point_inputs
-from model import GraphCodeBERTClassifier
+from model import LongCoderClassifier
 
 
-def _predict_point(model, tokenizer, code: str, device, max_seq_len: int,
-                    max_dfg: int, use_dfg: bool) -> dict:
-    if use_dfg:
-        b = build_point_inputs(code, tokenizer, max_seq_len, max_dfg)
-        input_ids = torch.from_numpy(b.input_ids).unsqueeze(0).to(device)
-        attn = torch.from_numpy(b.attention_mask).unsqueeze(0).to(device)
-        pos = torch.from_numpy(b.position_ids).unsqueeze(0).to(device)
-    else:
-        enc = tokenizer(code, truncation=True, padding="max_length",
-                        max_length=max_seq_len, return_tensors="pt")
-        input_ids = enc["input_ids"].to(device)
-        attn = enc["attention_mask"].to(device)
-        pos = torch.arange(max_seq_len, device=device).unsqueeze(0)
+def _predict_point(
+    model: LongCoderClassifier,
+    tokenizer,
+    code: str,
+    device: torch.device,
+    max_seq_len: int,
+    bridge_stride: int,
+) -> dict:
+    b = build_point_inputs(code, tokenizer, max_seq_len, bridge_stride)
+    input_ids = torch.from_numpy(b.input_ids).unsqueeze(0).to(device)
+    attn = torch.from_numpy(b.attention_mask).unsqueeze(0).to(device)
+    g_attn = torch.from_numpy(b.global_attention_mask).unsqueeze(0).to(device)
+    types = torch.from_numpy(b.token_type_ids).unsqueeze(0).to(device)
     with torch.no_grad():
-        logits = model(input_ids=input_ids, attention_mask=attn, position_ids=pos)
+        logits = model(
+            input_ids=input_ids,
+            attention_mask=attn,
+            global_attention_mask=g_attn,
+            token_type_ids=types,
+        )
     probs = torch.softmax(logits[0], dim=-1).cpu().numpy().tolist()
     idx = int(np.argmax(probs))
     return {
@@ -52,16 +57,14 @@ def _predict_point(model, tokenizer, code: str, device, max_seq_len: int,
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model_dir", required=True)
-    ap.add_argument("--max_seq_len", type=int, default=512)
-    ap.add_argument("--max_dfg_nodes", type=int, default=64)
-    ap.add_argument("--use_dfg", action="store_true", default=False,
-                    help="use tree-sitter DFG (only if the model was trained with --use_dfg)")
+    ap.add_argument("--max_seq_len", type=int, default=4096)
+    ap.add_argument("--bridge_stride", type=int, default=128)
     group = ap.add_mutually_exclusive_group(required=True)
     group.add_argument("--input", help="Python file path")
     group.add_argument("--stdin", action="store_true", help="Read snippet from stdin")
     args = ap.parse_args()
 
-    model = GraphCodeBERTClassifier.load_checkpoint(args.model_dir)
+    model = LongCoderClassifier.load_checkpoint(args.model_dir, merge_lora=True)
     model.eval()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
@@ -69,7 +72,7 @@ def main() -> int:
 
     code = sys.stdin.read() if args.stdin else Path(args.input).read_text(encoding="utf-8")
     result = _predict_point(model, tokenizer, code, device,
-                            args.max_seq_len, args.max_dfg_nodes, args.use_dfg)
+                            args.max_seq_len, args.bridge_stride)
     out = {"task": "point", **({"file": args.input} if args.input else {}), **result}
 
     print(json.dumps(out, indent=2))

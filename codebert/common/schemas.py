@@ -18,7 +18,7 @@ class PointRecord:
     code_sha256: str
     label: str                   # one of POINT_LABELS
     raw_complexity: str
-    tokens_graphcodebert: int
+    tokens_bpe: int
     ast_nodes: int
     augmented_from: Optional[str] = None
     split: str = "train"         # train | val | test
@@ -56,7 +56,7 @@ POINT_SCHEMA = pa.schema([
     ("code_sha256", pa.string()),
     ("label", pa.string()),
     ("raw_complexity", pa.string()),
-    ("tokens_graphcodebert", pa.int32()),
+    ("tokens_bpe", pa.int32()),
     ("ast_nodes", pa.int32()),
     ("augmented_from", pa.string()),
     ("split", pa.string()),

@@ -39,7 +39,7 @@ def main() -> int:
                 "code_sha256": r.get("code_sha256") or "",
                 "label": r["label"],
                 "raw_complexity": r.get("raw_complexity") or "",
-                "tokens_graphcodebert": int(r.get("tokens_graphcodebert") or 0),
+                "tokens_bpe": int(r.get("tokens_bpe") or 0),
                 "ast_nodes": int(r.get("ast_nodes") or 0),
                 "augmented_from": r.get("augmented_from"),
                 "split": r.get("split") or "train",

@@ -1,7 +1,7 @@
-"""Out-of-fold (OOF) pointwise BERT training + extraction.
+"""Out-of-fold (OOF) pointwise LongCoder training + extraction.
 
 Fixes the leakage problem: the default pipeline trains a single pointwise
-BERT on train.parquet, so its logits on any code in train.parquet (and
+encoder on train.parquet, so its logits on any code in train.parquet (and
 therefore on any code inside pair_train.parquet) are over-confident. Head
 training on those logits learns a sharp distribution that doesn't match
 val/test, leading to an optimistic train score and poor generalization.
@@ -11,9 +11,9 @@ This driver:
      a problem leak label information). If problem_id is missing/empty,
      falls back to code_sha256 for disjointness.
   2. For each fold i in [0..K-1]:
-       a) Train pointwise BERT on the union of the other K-1 folds.
+       a) Train pointwise LongCoder on the union of the other K-1 folds.
           (train.py is invoked via subprocess so we don't double-import.)
-       b) Predict per-code logits + CLS vectors on held-out fold i.
+       b) Predict per-code logits + pooled vectors on held-out fold i.
        c) Append those rows to the running train extraction table.
      After K iterations every train code has a logit vector from a model
      that NEVER saw its problem.
@@ -23,7 +23,7 @@ This driver:
 
 Output layout (matches bert_logits.py):
     <out_dir>/point_logits_train.parquet  (OOF predictions, one row per train code)
-    <out_dir>/point_cls_train.parquet     (OOF CLS vectors)
+    <out_dir>/point_cls_train.parquet     (OOF pooled vectors — last-token under LongCoder)
     <out_dir>/point_logits_val.parquet    (full-train-model predictions)
     <out_dir>/point_cls_val.parquet
     <out_dir>/point_logits_test.parquet
@@ -45,7 +45,7 @@ CLI:
         --data_dir data/processed \
         --out_dir runs/heads/extraction \
         --n_folds 5 \
-        --epochs 8 --batch_size 16 --grad_accum 2 --bf16
+        --epochs 40 --batch_size 2 --grad_accum 16 --bf16
 """
 
 from __future__ import annotations
@@ -68,7 +68,7 @@ from transformers import AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from model import GraphCodeBERTClassifier
+from model import LongCoderClassifier
 from stacking.features.bert_logits import (
     _IncrementalParquetWriter,
     _encode_point_batch,
@@ -79,6 +79,14 @@ from stacking.features.bert_logits import (
 # -----------------------------------------------------------------------------
 # Fold split: problem_id-disjoint, reproducible
 # -----------------------------------------------------------------------------
+
+def _checkpoint_exists(best_dir: Path) -> bool:
+    """A best/ checkpoint may be either full-FT (pytorch_model.bin) or LoRA
+    (adapter/ + classifier.pt). Either layout is valid for resume."""
+    has_full = (best_dir / "pytorch_model.bin").exists()
+    has_adapter = (best_dir / "adapter").exists() and (best_dir / "classifier.pt").exists()
+    return has_full or has_adapter
+
 
 def _fold_key(row: dict) -> str:
     """Return a stable group key for fold assignment.
@@ -155,14 +163,23 @@ def train_one_fold(
     bf16: bool,
     num_workers: int,
     max_seq_len: int,
+    bridge_stride: int,
     eval_every_steps: int,
     patience: int,
     seed: int,
+    lora: bool = False,
+    lora_r: int = 16,
+    lora_alpha: int = 32,
+    lora_dropout: float = 0.05,
+    lora_target_modules: str = "query,value,query_global,value_global",
+    lora_freeze_depth: int = 0,
+    activation_cache: bool = False,
+    activation_cache_dir: str | None = None,
 ) -> None:
     """Invoke train.py as a subprocess with fold-specific parquet paths."""
     run_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
-        sys.executable, "train.py", "--point",
+        sys.executable, "train.py",
         "--train_parquet", str(train_path),
         "--val_parquet", str(val_path),
         "--test_parquet", str(test_path),
@@ -173,6 +190,7 @@ def train_one_fold(
         "--lr", f"{lr}",
         "--num_workers", str(num_workers),
         "--max_seq_len", str(max_seq_len),
+        "--bridge_stride", str(bridge_stride),
         "--eval_every_steps", str(eval_every_steps),
         "--patience", str(patience),
         "--seed", str(seed),
@@ -181,15 +199,30 @@ def train_one_fold(
         cmd.append("--bf16")
     else:
         cmd.append("--no_bf16")
+    if lora:
+        cmd += [
+            "--lora",
+            "--lora_r", str(lora_r),
+            "--lora_alpha", str(lora_alpha),
+            "--lora_dropout", f"{lora_dropout}",
+            "--lora_target_modules", lora_target_modules,
+            "--lora_freeze_depth", str(lora_freeze_depth),
+        ]
+    if activation_cache:
+        cmd.append("--activation_cache")
+        if activation_cache_dir:
+            cmd += ["--activation_cache_dir", activation_cache_dir]
 
     print(f"[oof] fold {fold_idx}: {' '.join(cmd)}", flush=True)
     proc = subprocess.run(cmd, check=False)
     if proc.returncode != 0:
         raise RuntimeError(f"fold {fold_idx} training failed (exit={proc.returncode}); "
                            f"see {run_dir / 'train.log'}")
-    # Verify best/ exists
+    # Verify best/ exists with either the full-FT or LoRA layout
     best_dir = run_dir / "best"
-    if not (best_dir / "pytorch_model.bin").exists():
+    has_full = (best_dir / "pytorch_model.bin").exists()
+    has_adapter = (best_dir / "adapter").exists() and (best_dir / "classifier.pt").exists()
+    if not (has_full or has_adapter):
         raise RuntimeError(f"fold {fold_idx}: no best/ checkpoint produced at {best_dir}")
 
 
@@ -198,7 +231,7 @@ def train_one_fold(
 # -----------------------------------------------------------------------------
 
 def extract_logits_and_cls(
-    model: GraphCodeBERTClassifier,
+    model: LongCoderClassifier,
     tokenizer,
     codes: list[str],
     ids: list[str],
@@ -206,6 +239,7 @@ def extract_logits_and_cls(
     split_name: str,
     batch_size: int,
     max_seq_len: int,
+    bridge_stride: int,
     device: torch.device,
     fp16: bool,
 ) -> None:
@@ -215,7 +249,7 @@ def extract_logits_and_cls(
     for pm in model.parameters():
         pm.requires_grad_(False)
     n_labels = int(model.num_labels)
-    hidden = int(model.encoder.config.hidden_size)
+    hidden = int(model._base_longformer.config.hidden_size)
 
     logit_writer = _IncrementalParquetWriter(out_dir, f"point_logits_{split_name}", "id")
     cls_writer = _IncrementalParquetWriter(out_dir, f"point_cls_{split_name}", "id")
@@ -230,7 +264,7 @@ def extract_logits_and_cls(
     for start in tqdm(range(0, len(todo), bs), desc=f"oof-extract:{split_name}"):
         chunk = todo[start:start + bs]
         _, batch_ids, batch_codes = zip(*chunk)
-        enc = _encode_point_batch(list(batch_codes), tokenizer, max_seq_len)
+        enc = _encode_point_batch(list(batch_codes), tokenizer, max_seq_len, bridge_stride)
         try:
             logits, cls = _forward_with_cls(model, enc, device, use_fp16=fp16)
         except torch.cuda.OutOfMemoryError:
@@ -263,11 +297,12 @@ def extract_from_checkpoint(
     split_name: str,
     batch_size: int,
     max_seq_len: int,
+    bridge_stride: int,
     fp16: bool,
     device_str: str,
 ) -> None:
     device = torch.device(device_str)
-    model = GraphCodeBERTClassifier.load_checkpoint(ckpt_dir, task="point")
+    model = LongCoderClassifier.load_checkpoint(ckpt_dir, merge_lora=True)
     model = model.to(device)
     tokenizer = AutoTokenizer.from_pretrained(model.model_name)
     extract_logits_and_cls(
@@ -275,6 +310,7 @@ def extract_from_checkpoint(
         codes=codes, ids=ids,
         out_dir=out_dir, split_name=split_name,
         batch_size=batch_size, max_seq_len=max_seq_len,
+        bridge_stride=bridge_stride,
         device=device, fp16=fp16,
     )
     del model
@@ -301,19 +337,20 @@ def main() -> int:
     ap.add_argument("--epochs", type=int, default=40,
                     help="Hard upper bound per fold. Patience typically stops "
                          "training at ~15-20 epochs on the full train set.")
-    ap.add_argument("--batch_size", type=int, default=16)
-    ap.add_argument("--grad_accum", type=int, default=2)
+    ap.add_argument("--batch_size", type=int, default=2)
+    ap.add_argument("--grad_accum", type=int, default=16)
     ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--bf16", action="store_true", default=True)
     ap.add_argument("--no_bf16", dest="bf16", action="store_false")
     ap.add_argument("--num_workers", type=int, default=4)
-    ap.add_argument("--max_seq_len", type=int, default=512)
+    ap.add_argument("--max_seq_len", type=int, default=4096)
+    ap.add_argument("--bridge_stride", type=int, default=128)
     ap.add_argument("--eval_every_steps", type=int, default=100)
     ap.add_argument("--patience", type=int, default=3,
                     help="Stop after this many consecutive evals with no improvement.")
 
     # Extraction hyperparams
-    ap.add_argument("--extract_batch", type=int, default=32,
+    ap.add_argument("--extract_batch", type=int, default=4,
                     help="Batch size during per-fold inference extraction.")
     ap.add_argument("--extract_fp16", action="store_true", default=True,
                     help="fp16 autocast during extraction. bf16 not needed for inference.")
@@ -325,6 +362,16 @@ def main() -> int:
                     help="If a fold's best/ already exists, skip retraining it.")
     ap.add_argument("--skip_final", action="store_true",
                     help="Skip the final full-train model + val/test extraction.")
+
+    # LoRA finetuning flags (forwarded to train.py)
+    ap.add_argument("--lora", action="store_true", default=False)
+    ap.add_argument("--lora_r", type=int, default=16)
+    ap.add_argument("--lora_alpha", type=int, default=32)
+    ap.add_argument("--lora_dropout", type=float, default=0.05)
+    ap.add_argument("--lora_target_modules", default="query,value,query_global,value_global")
+    ap.add_argument("--lora_freeze_depth", type=int, default=0)
+    ap.add_argument("--activation_cache", action="store_true", default=False)
+    ap.add_argument("--activation_cache_dir", default=None)
     args = ap.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -359,7 +406,7 @@ def main() -> int:
     for fold_idx, (tp, held_p) in enumerate(fold_paths):
         run_dir = oof_root / f"fold_{fold_idx:02d}"
         best_dir = run_dir / "best"
-        if args.resume and (best_dir / "pytorch_model.bin").exists():
+        if args.resume and _checkpoint_exists(best_dir):
             print(f"[oof] fold {fold_idx}: using existing checkpoint at {best_dir}", flush=True)
         else:
             # Wipe stale run dir so we never mix epochs across invocations
@@ -372,8 +419,15 @@ def main() -> int:
                 epochs=args.epochs, batch_size=args.batch_size,
                 grad_accum=args.grad_accum, lr=args.lr, bf16=args.bf16,
                 num_workers=args.num_workers, max_seq_len=args.max_seq_len,
+                bridge_stride=args.bridge_stride,
                 eval_every_steps=args.eval_every_steps, patience=args.patience,
                 seed=args.seed + fold_idx,
+                lora=args.lora, lora_r=args.lora_r, lora_alpha=args.lora_alpha,
+                lora_dropout=args.lora_dropout,
+                lora_target_modules=args.lora_target_modules,
+                lora_freeze_depth=args.lora_freeze_depth,
+                activation_cache=args.activation_cache,
+                activation_cache_dir=args.activation_cache_dir,
             )
 
         # Inference on held-out fold using this fold's best checkpoint.
@@ -382,14 +436,14 @@ def main() -> int:
         held_codes = held_tbl.column("code").to_pylist()
         # Reuse the same writers so all folds land in one merged parquet.
         device = torch.device(args.device)
-        model = GraphCodeBERTClassifier.load_checkpoint(best_dir, task="point")
+        model = LongCoderClassifier.load_checkpoint(best_dir, merge_lora=True)
         model = model.to(device)
         tokenizer = AutoTokenizer.from_pretrained(model.model_name)
         model.eval()
         for pm in model.parameters():
             pm.requires_grad_(False)
         n_labels = int(model.num_labels)
-        hidden = int(model.encoder.config.hidden_size)
+        hidden = int(model._base_longformer.config.hidden_size)
 
         # Manual loop so we can write into the shared per-split writers.
         todo = [(id_, c) for id_, c in zip(held_ids, held_codes)
@@ -400,7 +454,7 @@ def main() -> int:
             chunk = todo[start:start + bs]
             batch_ids = [c[0] for c in chunk]
             batch_codes = [c[1] for c in chunk]
-            enc = _encode_point_batch(batch_codes, tokenizer, args.max_seq_len)
+            enc = _encode_point_batch(batch_codes, tokenizer, args.max_seq_len, args.bridge_stride)
             try:
                 logits, cls = _forward_with_cls(
                     model, enc, device, use_fp16=args.extract_fp16,
@@ -435,7 +489,7 @@ def main() -> int:
     else:
         final_dir = oof_root / "full"
         best_dir = final_dir / "best"
-        if args.resume and (best_dir / "pytorch_model.bin").exists():
+        if args.resume and _checkpoint_exists(best_dir):
             print(f"[oof] final: using existing checkpoint at {best_dir}", flush=True)
         else:
             if final_dir.exists():
@@ -448,8 +502,15 @@ def main() -> int:
                 epochs=args.epochs, batch_size=args.batch_size,
                 grad_accum=args.grad_accum, lr=args.lr, bf16=args.bf16,
                 num_workers=args.num_workers, max_seq_len=args.max_seq_len,
+                bridge_stride=args.bridge_stride,
                 eval_every_steps=args.eval_every_steps, patience=args.patience,
                 seed=args.seed,
+                lora=args.lora, lora_r=args.lora_r, lora_alpha=args.lora_alpha,
+                lora_dropout=args.lora_dropout,
+                lora_target_modules=args.lora_target_modules,
+                lora_freeze_depth=args.lora_freeze_depth,
+                activation_cache=args.activation_cache,
+                activation_cache_dir=args.activation_cache_dir,
             )
 
         for split, pq_path in (("val", val_pq), ("test", test_pq)):
@@ -462,6 +523,7 @@ def main() -> int:
                 out_dir=out_dir, split_name=split,
                 batch_size=args.extract_batch,
                 max_seq_len=args.max_seq_len,
+                bridge_stride=args.bridge_stride,
                 fp16=args.extract_fp16,
                 device_str=args.device,
             )
@@ -471,6 +533,8 @@ def main() -> int:
         "oof": True,
         "n_folds": args.n_folds,
         "seed": args.seed,
+        "max_seq_len": args.max_seq_len,
+        "bridge_stride": args.bridge_stride,
         "splits_dir": str(oof_root / "splits"),
         "fold_run_dirs": [str(oof_root / f"fold_{k:02d}") for k in range(args.n_folds)],
         "full_run_dir": str(oof_root / "full"),

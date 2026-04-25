@@ -1,4 +1,4 @@
-"""Train GraphCodeBERT on the pointwise code-complexity task.
+"""Train LongCoder on the pointwise code-complexity task.
 
 Usage:
     python train.py --data_dir data/processed --epochs 8
@@ -78,7 +78,7 @@ from common.labels import POINT_LABELS
 
 @dataclass
 class Config:
-    model_name: str = "microsoft/graphcodebert-base"
+    model_name: str = "microsoft/longcoder-base"
     data_dir: str = "data/processed"
     output_dir: str = ""
     # Explicit per-split parquet overrides. Used by OOF driver (stacking/features/oof_point.py)
@@ -87,12 +87,12 @@ class Config:
     train_parquet: str = ""
     val_parquet: str = ""
     test_parquet: str = ""
-    max_seq_len: int = 512
-    max_dfg_nodes: int = 64
-    batch_size: int = 16
-    grad_accum: int = 2
+    max_seq_len: int = 4096
+    bridge_stride: int = 128
+    batch_size: int = 2
+    grad_accum: int = 16
     lr: float = 2e-5
-    warmup_ratio: float = 0.1
+    warmup_ratio: float = 0.15
     weight_decay: float = 0.01
     epochs: int = 50                 # generous upper bound; patience is the real stopper
     label_smoothing: float = 0.0
@@ -108,8 +108,19 @@ class Config:
     num_workers: int = 4
     prefetch_factor: int = 4
     cache_dir: str = ""
-    use_dfg: bool = False   # DEFAULT: simple tokenization, no DFG. Set True for paper-faithful.
     balanced_sampler: bool = True   # WeightedRandomSampler on train
+
+    # LoRA — see model.LoraSpec
+    lora: bool = False
+    lora_r: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.05
+    lora_target_modules: str = "query,value,query_global,value_global"
+    lora_freeze_depth: int = 0      # 0 = LoRA on all 12 layers; K = layers <K fully frozen, LoRA on layers >=K
+
+    # Frozen-activation cache (only valid when lora=True and lora_freeze_depth>0)
+    activation_cache: bool = False
+    activation_cache_dir: str = ""
 
 
 def load_config(cli: argparse.Namespace) -> Config:
@@ -138,6 +149,26 @@ def set_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def _forward_kwargs(batch: dict) -> dict:
+    """Build kwargs for model.forward from a batch.
+
+    When the dataset yields cached_hidden (activation_cache=True), the model
+    routes through the partial-encoder path. The full-input fields are still
+    needed because the partial path reads attention_mask + global_attention_mask
+    to rebuild the extended mask.
+    """
+    out = {
+        "attention_mask": batch["attention_mask"],
+        "global_attention_mask": batch["global_attention_mask"],
+    }
+    if "cached_hidden" in batch:
+        out["cached_hidden"] = batch["cached_hidden"]
+    else:
+        out["input_ids"] = batch["input_ids"]
+        out["token_type_ids"] = batch["token_type_ids"]
+    return out
 
 
 def linear_warmup_linear_decay(optimizer, num_warmup: int, num_total: int):
@@ -175,11 +206,7 @@ def evaluate(model, loader, device, max_batches: int | None = None) -> dict:
             if max_batches is not None and i >= max_batches:
                 break
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-            logits = model(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                position_ids=batch["position_ids"],
-            )
+            logits = model(**_forward_kwargs(batch))
             preds = logits.argmax(dim=-1).cpu().tolist()
             labels = batch["labels"].cpu().tolist()
             all_preds.extend(preds)
@@ -238,7 +265,8 @@ def main() -> int:
     ap.add_argument("--test_parquet", default=None,
                     help="Override test split path (used by OOF driver).")
     ap.add_argument("--max_seq_len", type=int, default=None)
-    ap.add_argument("--max_dfg_nodes", type=int, default=None)
+    ap.add_argument("--bridge_stride", type=int, default=None,
+                    help="Insert a bridge token every N code tokens (LongCoder).")
     ap.add_argument("--batch_size", type=int, default=None)
     ap.add_argument("--grad_accum", type=int, default=None)
     ap.add_argument("--lr", type=float, default=None)
@@ -260,14 +288,27 @@ def main() -> int:
     ap.add_argument("--num_workers", type=int, default=None)
     ap.add_argument("--prefetch_factor", type=int, default=None)
     ap.add_argument("--cache_dir", default=None)
-    ap.add_argument("--use_dfg", action="store_true", default=None,
-                    help="Paper-faithful mode: tree-sitter DFG + 2D graph attention mask")
-    ap.add_argument("--no_dfg", dest="use_dfg", action="store_false",
-                    help="Simple mode (default): standard 1D tokenization, no DFG")
     ap.add_argument("--balanced_sampler", action="store_true", default=None,
                     help="WeightedRandomSampler on train set (default on)")
     ap.add_argument("--no_balanced_sampler", dest="balanced_sampler", action="store_false",
                     help="Plain shuffled sampler; rely only on loss class weights")
+    ap.add_argument("--lora", action="store_true", default=None,
+                    help="Enable LoRA finetuning. Frozen base + low-rank adapters on Q+V projections.")
+    ap.add_argument("--no_lora", dest="lora", action="store_false")
+    ap.add_argument("--lora_r", type=int, default=None)
+    ap.add_argument("--lora_alpha", type=int, default=None)
+    ap.add_argument("--lora_dropout", type=float, default=None)
+    ap.add_argument("--lora_target_modules", default=None,
+                    help="csv list of target module names (default: query,value,query_global,value_global)")
+    ap.add_argument("--lora_freeze_depth", type=int, default=None,
+                    help="0 = LoRA on all layers; K = layers 0..K-1 fully frozen, LoRA on K..11.")
+    ap.add_argument("--activation_cache", action="store_true", default=None,
+                    help="Read frozen-prefix activations from cache; partial encoder forward "
+                         "from layer lora_freeze_depth. Requires the cache to be prewarmed by "
+                         "cache_activations.py.")
+    ap.add_argument("--no_activation_cache", dest="activation_cache", action="store_false")
+    ap.add_argument("--activation_cache_dir", default=None,
+                    help="Override the activation cache root.")
     args = ap.parse_args()
 
     cfg = load_config(args)
@@ -297,18 +338,36 @@ def main() -> int:
     logger.info("data paths: train=%s val=%s test=%s", train_path, val_path, test_path)
 
     logger.info("loading datasets from %s ...", data_root)
+    if cfg.activation_cache and not (cfg.lora and cfg.lora_freeze_depth > 0):
+        raise ValueError(
+            "--activation_cache requires --lora --lora_freeze_depth K (K>0). "
+            "Cached activations are only meaningful when the bottom K layers "
+            "are fully frozen."
+        )
+
+    activation_cfg = None
+    if cfg.activation_cache:
+        from data import ActivationCacheConfig
+        activation_cfg = ActivationCacheConfig(
+            model_name=cfg.model_name,
+            freeze_depth=cfg.lora_freeze_depth,
+            cache_dir=cfg.activation_cache_dir or None,
+        )
+        logger.info("activation cache enabled: %s", activation_cfg)
+
     ds_kwargs = dict(
         tokenizer=tokenizer,
         max_seq_len=cfg.max_seq_len,
-        max_dfg_nodes=cfg.max_dfg_nodes,
+        bridge_stride=cfg.bridge_stride,
         cache_dir=cfg.cache_dir or None,
-        use_dfg=cfg.use_dfg,
+        activation_cache=activation_cfg,
     )
     train_ds = DS(train_path, **ds_kwargs)
     val_ds = DS(val_path, **ds_kwargs)
     test_ds = DS(test_path, **ds_kwargs)
-    logger.info("train=%d  val=%d  test=%d  use_dfg=%s",
-                len(train_ds), len(val_ds), len(test_ds), cfg.use_dfg)
+    logger.info("train=%d  val=%d  test=%d  seq_len=%d  bridge_stride=%d",
+                len(train_ds), len(val_ds), len(test_ds),
+                cfg.max_seq_len, cfg.bridge_stride)
 
     if cfg.dry_run:
         # Cheap smoke mode
@@ -357,13 +416,22 @@ def main() -> int:
                 train_sampler is not None)
 
     # --- model -----
-    logger.info("building model (%s) ...", cfg.model_name)
-    model = build_model(cfg.model_name)
+    from model import LoraSpec
+    lora_spec = LoraSpec(
+        enabled=cfg.lora,
+        r=cfg.lora_r, alpha=cfg.lora_alpha, dropout=cfg.lora_dropout,
+        target_modules=tuple(s.strip() for s in cfg.lora_target_modules.split(",") if s.strip()),
+        freeze_depth=cfg.lora_freeze_depth,
+    )
+    logger.info("building model (%s, lora=%s) ...", cfg.model_name, lora_spec.to_dict())
+    model = build_model(cfg.model_name, lora=lora_spec)
     logger.info("moving model to %s ...", device)
     model = model.to(device)
     n_params = sum(p.numel() for p in model.parameters())
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info("model params total=%s trainable=%s", f"{n_params:,}", f"{n_trainable:,}")
+    pct = 100.0 * n_trainable / max(1, n_params)
+    logger.info("model params total=%s trainable=%s (%.2f%%)",
+                f"{n_params:,}", f"{n_trainable:,}", pct)
 
     # --- loss -----
     weights = resolve_class_weights(cfg)
@@ -372,11 +440,15 @@ def main() -> int:
     loss_fn = nn.CrossEntropyLoss(weight=weights, label_smoothing=cfg.label_smoothing)
 
     # --- optim / sched -----
+    # Only register parameters that will actually receive grads — frozen
+    # base weights (LoRA) and any layers below freeze_depth must not enter
+    # the optimizer state.
     no_decay = ("bias", "LayerNorm.weight")
+    trainable = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     grouped = [
-        {"params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+        {"params": [p for n, p in trainable if not any(nd in n for nd in no_decay)],
          "weight_decay": cfg.weight_decay},
-        {"params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+        {"params": [p for n, p in trainable if any(nd in n for nd in no_decay)],
          "weight_decay": 0.0},
     ]
     optimizer = AdamW(grouped, lr=cfg.lr)
@@ -430,20 +502,13 @@ def main() -> int:
             )
             for local_step, batch in enumerate(pbar):
                 batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+                kwargs = _forward_kwargs(batch)
                 if use_bf16:
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                        logits = model(
-                            input_ids=batch["input_ids"],
-                            attention_mask=batch["attention_mask"],
-                            position_ids=batch["position_ids"],
-                        )
+                        logits = model(**kwargs)
                         loss = loss_fn(logits, batch["labels"]) / cfg.grad_accum
                 else:
-                    logits = model(
-                        input_ids=batch["input_ids"],
-                        attention_mask=batch["attention_mask"],
-                        position_ids=batch["position_ids"],
-                    )
+                    logits = model(**kwargs)
                     loss = loss_fn(logits, batch["labels"]) / cfg.grad_accum
                 loss.backward()
                 if (local_step + 1) % cfg.grad_accum == 0:
@@ -457,8 +522,8 @@ def main() -> int:
                                                "lr": scheduler.get_last_lr()[0]}) + "\n")
                     pbar.set_postfix(step=step, loss=f"{loss_val:.3f}",
                                      lr=f"{scheduler.get_last_lr()[0]:.2e}")
-                    # Verbose early so the user sees progress while DFG cache warms up;
-                    # taper to 1/20 the eval cadence after the first 10 global steps.
+                    # Verbose early while the bundle cache warms up; taper to 1/20 the
+                    # eval cadence after the first 10 global steps.
                     log_interval = 1 if step <= 10 else max(1, cfg.eval_every_steps // 10)
                     if step % log_interval == 0:
                         logger.info("epoch=%d step=%d lr=%.2e loss=%.4f",
@@ -518,9 +583,11 @@ def _log_safe(met: dict) -> dict:
 
 def _final_report(model, dl_test, device, out_root: Path, cfg: Config) -> int:
     best_dir = out_root / "best"
-    if best_dir.exists() and (best_dir / "pytorch_model.bin").exists():
-        state = torch.load(best_dir / "pytorch_model.bin", map_location=device)
-        model.load_state_dict(state)
+    if best_dir.exists() and (best_dir / "codebert_meta.json").exists():
+        # Restore the val-F1-best model. Either layout (full-FT pytorch_model.bin
+        # or LoRA adapter/+classifier.pt) is handled by load_checkpoint.
+        from model import LongCoderClassifier
+        model = LongCoderClassifier.load_checkpoint(best_dir).to(device)
     met = evaluate(model, dl_test, device)
     met["seed"] = cfg.seed
     met["task"] = "point"

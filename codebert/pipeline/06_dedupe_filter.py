@@ -2,7 +2,7 @@
 
 1) MinHash LSH across *all* sources to drop near-duplicate code (threshold 0.85).
 2) ast.parse() sanity check.
-3) Token-length gate via GraphCodeBERT tokenizer if available,
+3) Token-length gate via LongCoder tokenizer if available,
    else a char-length heuristic (~4.2 chars/token for Python).
 
 Output:
@@ -44,12 +44,12 @@ def _minhash(tokens: set[str], num_perm: int = 64) -> MinHash:
     return m
 
 
-def _load_gcb_tokenizer():
+def _load_bpe_tokenizer():
     try:
         from transformers import AutoTokenizer  # type: ignore
         import transformers.utils.logging as hf_logging  # type: ignore
         hf_logging.set_verbosity_error()   # silence per-sample "too long" spam
-        tok = AutoTokenizer.from_pretrained("microsoft/graphcodebert-base")
+        tok = AutoTokenizer.from_pretrained("microsoft/longcoder-base")
         # Bump effective max so the tokenizer doesn't warn on samples we'll drop anyway.
         tok.model_max_length = 1_000_000
         return tok
@@ -68,7 +68,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--in_path", default="data/interim/normalized/combined.jsonl")
     ap.add_argument("--out", default="data/interim/filtered.jsonl")
-    ap.add_argument("--max_tokens", type=int, default=512)
+    ap.add_argument("--max_tokens", type=int, default=3900,
+                    help="Token-count cap (LongCoder seq_len 4096 minus headroom for "
+                         "CLS, SEP, bridge, and memory tokens).")
     ap.add_argument("--min_tokens", type=int, default=6)
     ap.add_argument("--threshold", type=float, default=0.85)
     ap.add_argument("--skip_tokenizer", action="store_true",
@@ -81,7 +83,7 @@ def main() -> int:
         print(f"[06] {in_path} missing — did 05 run?", file=sys.stderr)
         return 1
 
-    tokenizer = None if args.skip_tokenizer else _load_gcb_tokenizer()
+    tokenizer = None if args.skip_tokenizer else _load_bpe_tokenizer()
     lsh = MinHashLSH(threshold=args.threshold, num_perm=64)
 
     n_in = n_kept = n_ast_fail = n_dup = n_too_long = n_too_short = 0
@@ -101,7 +103,7 @@ def main() -> int:
 
             # 2) token length
             tl = token_len(code, tokenizer)
-            rec["tokens_graphcodebert"] = tl
+            rec["tokens_bpe"] = tl
             if tl > args.max_tokens:
                 n_too_long += 1
                 continue
