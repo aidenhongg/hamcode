@@ -78,12 +78,18 @@ echo "=== [0b] python deps ==="
 # can't resolve some recent tree-sitter wheels).
 python -m pip install --quiet --upgrade pip wheel setuptools
 
-# CUDA-matched torch from the cu128 index. cu128 wheels run fine on Ada (4090,
-# sm_89), Hopper, and Blackwell; if you're on Turing/Volta swap to cu121.
-python -m pip install --quiet --index-url https://download.pytorch.org/whl/cu128 torch
+# CUDA-matched torch from the cu124 index. The 4090 (Ada, sm_89) works on cu121
+# / cu124 / cu126 / cu128 — but Runpod's 4090 templates ship driver 12.4 most
+# reliably, and the cu128 index has started serving +cu130 wheels at HEAD which
+# need driver 12.8+. cu124 is the safest pin: matches driver 12.4 exactly and
+# falls forward to any newer driver.
+# --force-reinstall guards against a previously-broken torch (e.g. +cu130)
+# already installed in the pod from a prior bootstrap attempt.
+python -m pip install --quiet --force-reinstall \
+    --index-url https://download.pytorch.org/whl/cu124 torch
 
 # Strip torchvision/torchaudio if the base image bundled them — they almost
-# certainly won't match the cu128 torch we just installed and will explode on
+# certainly won't match the cu124 torch we just installed and will explode on
 # transformers' lazy-vision import.
 python -m pip uninstall --quiet -y torchvision torchaudio || true
 

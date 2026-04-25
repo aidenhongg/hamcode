@@ -1,9 +1,12 @@
-# Core ML stack — tested on RTX 4090 (Ada, sm_89) Runpod via cu128 wheels.
-# Ada cards work fine with cu128; cu121 wheels also work if you prefer the older index.
-# RunPod: pick `nvidia/cuda:12.8.0-cudnn-devel-ubuntu22.04` for the matching base image.
+# Core ML stack — tested on RTX 4090 (Ada, sm_89) Runpod.
 #
-# Install torch from the cu128 index (no version pin — any 2.7+ works):
-#   pip install --index-url https://download.pytorch.org/whl/cu128 torch
+# IMPORTANT: install torch from the cu124 index, NOT cu128.  PyTorch's cu128
+# index has started shipping +cu130 wheels at the latest version, which need
+# NVIDIA driver 12.8+; many current Runpod 4090 templates only ship driver
+# 12.4. cu124 wheels work on driver 12.4+ which covers all current templates.
+#
+#   pip install --force-reinstall --index-url https://download.pytorch.org/whl/cu124 torch
+#
 # If the base image ships torchvision/torchaudio, uninstall them to avoid
 # transformers' lazy-vision import exploding:
 #   pip uninstall -y torchvision torchaudio
