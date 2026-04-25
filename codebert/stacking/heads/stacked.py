@@ -1,12 +1,12 @@
 """Stacked meta-learner. Configurable base subset + meta classifier.
 
-Base heads: any subset of {xgb, lgbm, mlp, logreg, rf}. Each is trained on
-the full train set; their train-set class-1 probabilities become a feature
-vector for the meta. Meta is one of {logreg, mlp, xgb}.
+Base heads: any subset of {xgb, lgbm, mlp}. Each is trained on the full
+train set; their train-set class-1 probabilities become a feature vector
+for the meta. Meta is one of {logreg, mlp, xgb}.
 
 We do NOT nested-CV the base-head predictions for the meta (too slow on
 the head sweep). In practice the meta is already a small model on a tiny
-probability vector (≤5 dims), so the overfitting headroom is limited;
+probability vector (≤3 dims), so the overfitting headroom is limited;
 what matters is that the base heads are diverse enough that the meta
 finds a non-trivial combination.
 """
@@ -23,7 +23,7 @@ from .base import HeadRegistry
 
 
 _DEFAULT_BASES: tuple[str, ...] = ("xgb", "lgbm", "mlp")
-_ALLOWED_BASES: tuple[str, ...] = ("xgb", "lgbm", "mlp", "logreg", "rf")
+_ALLOWED_BASES: tuple[str, ...] = ("xgb", "lgbm", "mlp")
 _ALLOWED_METAS: tuple[str, ...] = ("logreg", "mlp", "xgb")
 
 
@@ -60,20 +60,16 @@ class StackedHead:
     # -----------------------------------------------------------------
 
     def _build_bases(self) -> dict[str, object]:
-        from . import xgb, lgbm, mlp, logreg, rf  # noqa: F401
-        factories = {
-            "xgb":    lambda hp: _XGB(seed=self.hp["seed"], **hp),
-            "lgbm":   lambda hp: _LGBM(seed=self.hp["seed"], **hp),
-            "mlp":    lambda hp: _MLP(seed=self.hp["seed"], **hp),
-            "logreg": lambda hp: _LR(seed=self.hp["seed"], **hp),
-            "rf":     lambda hp: _RF(seed=self.hp["seed"], **hp),
-        }
+        from . import xgb, lgbm, mlp  # noqa: F401
         # Resolve head classes at call-time (avoid top-level import cycles).
         from .xgb import XGBHead as _XGB
         from .lgbm import LGBMHead as _LGBM
         from .mlp import MLPHead as _MLP
-        from .logreg import LogRegHead as _LR
-        from .rf import RFHead as _RF
+        factories = {
+            "xgb":  lambda hp: _XGB(seed=self.hp["seed"], **hp),
+            "lgbm": lambda hp: _LGBM(seed=self.hp["seed"], **hp),
+            "mlp":  lambda hp: _MLP(seed=self.hp["seed"], **hp),
+        }
         out: dict[str, object] = {}
         for b in self.hp["bases"]:
             hp = self.hp["base_hp"].get(b, {})
@@ -162,14 +158,12 @@ class StackedHead:
             base_hp=hp.get("base_hp"), meta_hp=hp.get("meta_hp"),
         )
         # Rehydrate base + meta from disk (don't reuse the freshly-built ones)
-        from . import xgb, lgbm, mlp, logreg, rf  # noqa
+        from . import xgb, lgbm, mlp  # noqa
         from .xgb import XGBHead
         from .lgbm import LGBMHead
         from .mlp import MLPHead
-        from .logreg import LogRegHead
-        from .rf import RFHead
-        klasses = {"xgb": XGBHead, "lgbm": LGBMHead, "mlp": MLPHead,
-                   "logreg": LogRegHead, "rf": RFHead}
+        from .logreg import LogRegHead  # meta-only
+        klasses = {"xgb": XGBHead, "lgbm": LGBMHead, "mlp": MLPHead}
         inst.base = {n: klasses[n].load(out_dir / f"base_{n}") for n in hp["bases"]}
         meta_kls = {"logreg": LogRegHead, "mlp": MLPHead, "xgb": XGBHead}[hp["meta"]]
         inst.meta_head = meta_kls.load(out_dir / "meta")

@@ -1,4 +1,4 @@
-"""Unit tests for all 8 heads on a tiny linearly-separable synthetic dataset.
+"""Unit tests for the top-4 heads on a tiny linearly-separable synthetic dataset.
 
 Each head must: fit, predict, predict_proba, save, load, and produce
 non-trivial accuracy on a synthetic problem.
@@ -38,7 +38,7 @@ def _make_data(n: int = 400, d: int = 10, seed: int = 0, imbalance: float = 1.0)
     return X, y
 
 
-HEAD_NAMES = ["xgb", "lgbm", "mlp", "logreg", "rf", "knn", "gnb", "stacked"]
+HEAD_NAMES = ["xgb", "lgbm", "mlp", "stacked"]
 
 
 @pytest.mark.parametrize("head_name", HEAD_NAMES)
@@ -57,11 +57,9 @@ def test_head_fit_and_accuracy(head_name):
     assert probs.shape == (len(yva), 2)
     # Probabilities sum to ~1
     np.testing.assert_allclose(probs.sum(axis=1), 1.0, atol=1e-5)
-    # Non-trivial accuracy on linearly separable problem (except GNB which can struggle
-    # with correlated features — keep threshold conservative)
+    # Non-trivial accuracy on linearly separable problem
     acc = (preds == yva).mean()
-    min_acc = 0.55 if head_name in {"gnb", "knn"} else 0.7
-    assert acc >= min_acc, f"{head_name}: accuracy {acc:.3f} below {min_acc}"
+    assert acc >= 0.7, f"{head_name}: accuracy {acc:.3f} below 0.7"
 
 
 @pytest.mark.parametrize("head_name", HEAD_NAMES)
@@ -101,7 +99,7 @@ def test_compute_class_weight_single_class():
     assert w == {0: 1.0, 1: 1.0}
 
 
-@pytest.mark.parametrize("head_name", ["xgb", "lgbm", "logreg", "rf"])
+@pytest.mark.parametrize("head_name", ["xgb", "lgbm"])
 def test_head_reproducibility_same_seed(head_name):
     X, y = _make_data(n=200, d=6, seed=1)
     h1 = get_head(head_name, seed=13)

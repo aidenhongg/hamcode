@@ -117,13 +117,13 @@ def _space_mlp(trial: "optuna.Trial", seed: int, device: str | None = None) -> d
 def _space_stacked(trial: "optuna.Trial", seed: int) -> dict:
     # Use binary flags to include each base head. Require at least 2 bases
     # (otherwise stacking degenerates to a wrapper around one head).
-    candidates = ["xgb", "lgbm", "mlp", "logreg", "rf"]
+    candidates = ["xgb", "lgbm", "mlp"]
     include = {name: trial.suggest_categorical(f"use_{name}", [True, False])
                for name in candidates}
     bases = [n for n in candidates if include[n]]
     if len(bases) < 2:
         # Inflate with cheapest sensible default to make the trial valid.
-        for extra in ("xgb", "lgbm", "logreg"):
+        for extra in ("xgb", "lgbm", "mlp"):
             if extra not in bases:
                 bases.append(extra)
             if len(bases) >= 2:
@@ -329,10 +329,10 @@ def space_hp_from_best(
             hp["device"] = mlp_device
         return hp
     if head_name == "stacked":
-        candidates = ["xgb", "lgbm", "mlp", "logreg", "rf"]
+        candidates = ["xgb", "lgbm", "mlp"]
         bases = [n for n in candidates if best_params.get(f"use_{n}", False)]
         if len(bases) < 2:
-            for extra in ("xgb", "lgbm", "logreg"):
+            for extra in ("xgb", "lgbm", "mlp"):
                 if extra not in bases:
                     bases.append(extra)
                 if len(bases) >= 2:

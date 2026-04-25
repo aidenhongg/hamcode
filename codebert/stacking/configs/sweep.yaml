@@ -1,5 +1,5 @@
-# Default sweep config: 8 heads x 3 variants x 3 seeds = 72 experiments.
-heads: [xgb, lgbm, mlp, logreg, rf, knn, gnb, stacked]
-variants: [v1, v2, v3]
+# Default sweep config: 4 heads x 1 variant x 3 seeds = 12 experiments.
+heads: [xgb, lgbm, mlp, stacked]
+variants: [v1]
 seeds: [42, 43, 44]
 class_weight: auto
