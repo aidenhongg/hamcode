@@ -196,12 +196,27 @@ def resolve_class_weights(cfg: Config) -> torch.Tensor | None:
 
 # ------------------------------------------------------------------ train loop
 
-def evaluate(model, loader, device, max_batches: int | None = None) -> dict:
+def evaluate(
+    model,
+    loader,
+    device,
+    max_batches: int | None = None,
+    bf16: bool = True,
+) -> dict:
+    """Run validation/test eval. Uses bf16 autocast on CUDA when bf16=True so
+    eval throughput matches training throughput (otherwise fp32 eval ends up
+    ~2x slower per token)."""
+    from contextlib import nullcontext
     model.eval()
     all_preds: list[int] = []
     all_labels: list[int] = []
     iterable = tqdm(loader, desc="eval", leave=False, dynamic_ncols=True, mininterval=1.0)
-    with torch.no_grad():
+    use_amp = bf16 and device.type == "cuda"
+    autocast_ctx = (
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if use_amp else nullcontext()
+    )
+    with torch.no_grad(), autocast_ctx:
         for i, batch in enumerate(iterable):
             if max_batches is not None and i >= max_batches:
                 break
@@ -529,7 +544,7 @@ def main() -> int:
                         logger.info("epoch=%d step=%d lr=%.2e loss=%.4f",
                                     epoch, step, scheduler.get_last_lr()[0], loss_val)
                     if step > 0 and step % cfg.eval_every_steps == 0:
-                        met = evaluate(model, dl_val, device)
+                        met = evaluate(model, dl_val, device, bf16=cfg.bf16)
                         rec = {"step": step, "epoch": epoch, "split": "val", **_log_safe(met)}
                         metrics_log.write(json.dumps(rec) + "\n"); metrics_log.flush()
                         loss_log.flush()
@@ -588,7 +603,7 @@ def _final_report(model, dl_test, device, out_root: Path, cfg: Config) -> int:
         # or LoRA adapter/+classifier.pt) is handled by load_checkpoint.
         from model import LongCoderClassifier
         model = LongCoderClassifier.load_checkpoint(best_dir).to(device)
-    met = evaluate(model, dl_test, device)
+    met = evaluate(model, dl_test, device, bf16=cfg.bf16)
     met["seed"] = cfg.seed
     met["task"] = "point"
     (out_root / "test_metrics.json").write_text(json.dumps(met, indent=2), encoding="utf-8")

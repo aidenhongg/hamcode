@@ -12,15 +12,15 @@
 
 defaults: &defaults
   epochs: 40
-  batch_size: 4
-  grad_accum: 8
+  batch_size: 16            # LoRA + frozen prefix → small live VRAM, GPU underutilized at bs=4
+  grad_accum: 2             # effective batch 32, same as bs=4 + ga=8
   num_workers: 4
   max_seq_len: 4096
   bridge_stride: 128
   eval_every_steps: 100
   patience: 3
   bf16: true
-  extract_batch: 4
+  extract_batch: 8
   lr: 1.0e-4               # LoRA-recommended; full-FT (if added) should override to 2e-5
 
 recipes:
