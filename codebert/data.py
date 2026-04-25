@@ -350,6 +350,7 @@ class _FrozenActivationCache:
                 tmp.unlink()
             except OSError:
                 pass
+            raise   # let disk-full / permission failures surface during prewarm
 
 
 # -----------------------------------------------------------------------------

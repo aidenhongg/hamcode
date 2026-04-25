@@ -152,6 +152,42 @@ def test_save_load_roundtrip_lora_with_merge(small_inputs):
         f"merge_lora diverged: max diff {(before - after).abs().max().item()}"
 
 
+def test_partial_forward_accepts_bf16_cached_hidden(small_inputs):
+    """Eval (no autocast) with a bf16 cache must still run.
+
+    Before the dtype-cast fix, a bf16 cached_hidden hitting an fp32 Linear in
+    LongformerSelfAttention raised RuntimeError('expected scalar type Float
+    but found BFloat16'). This regression-tests the fix.
+    """
+    code, inputs = small_inputs
+    spec = LoraSpec(enabled=True, r=8, alpha=16, dropout=0.0, freeze_depth=4)
+    model = LongCoderClassifier(model_name=MODEL_NAME, lora=spec).eval()
+    from cache_activations import compute_prefix_activation
+    with torch.no_grad():
+        cached_fp32 = compute_prefix_activation(
+            model._base_longformer,
+            inputs["input_ids"], inputs["attention_mask"],
+            inputs["global_attention_mask"], inputs["token_type_ids"],
+            freeze_depth=4,
+        )
+    cached_bf16 = cached_fp32.to(torch.bfloat16)
+    with torch.no_grad():
+        out_fp32 = model(
+            attention_mask=inputs["attention_mask"],
+            global_attention_mask=inputs["global_attention_mask"],
+            cached_hidden=cached_fp32,
+        )
+        out_bf16 = model(
+            attention_mask=inputs["attention_mask"],
+            global_attention_mask=inputs["global_attention_mask"],
+            cached_hidden=cached_bf16,
+        )
+    assert torch.allclose(out_fp32, out_bf16, atol=1e-2), (
+        f"bf16 cached_hidden diverged from fp32 by "
+        f"{(out_fp32 - out_bf16).abs().max().item()}"
+    )
+
+
 def test_activation_cache_roundtrip_bf16():
     cache = _FrozenActivationCache(tempfile.mkdtemp())
     code = "def f(): return 1"

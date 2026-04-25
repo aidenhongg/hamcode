@@ -183,6 +183,12 @@ class LongCoderClassifier(nn.Module):
                 "cached_hidden requires freeze_depth > 0; got freeze_depth=0."
             )
         lf = self._base_longformer
+        # The cache may store activations as bf16 (default) but the encoder weights
+        # are fp32. Under autocast the dtypes auto-align; without autocast (eval)
+        # bf16 input + fp32 Linear raises. Always cast cached_hidden to the encoder's
+        # parameter dtype so the layer call works in both contexts. Autocast will
+        # downcast for the matmul if it's active.
+        cached_hidden = cached_hidden.to(dtype=next(lf.parameters()).dtype)
         orig_len = cached_hidden.size(1)
         hidden, padded_attn, padded_global = _pad_for_longformer(
             lf, cached_hidden, attention_mask, global_attention_mask,
