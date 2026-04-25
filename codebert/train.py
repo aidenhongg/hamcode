@@ -69,7 +69,7 @@ from data import (
     compute_class_weights,
     make_collator,
 )
-from metrics import pointwise_metrics, pretty_confusion
+from metrics import pointwise_metrics, pointwise_metrics_per_language, pretty_confusion
 from model import build_model
 from common.labels import POINT_LABELS
 
@@ -87,10 +87,10 @@ class Config:
     train_parquet: str = ""
     val_parquet: str = ""
     test_parquet: str = ""
-    max_seq_len: int = 4096
+    max_seq_len: int = 1024
     bridge_stride: int = 128
-    batch_size: int = 2
-    grad_accum: int = 16
+    batch_size: int = 8
+    grad_accum: int = 4
     lr: float = 2e-5
     warmup_ratio: float = 0.15
     weight_decay: float = 0.01
@@ -109,18 +109,6 @@ class Config:
     prefetch_factor: int = 4
     cache_dir: str = ""
     balanced_sampler: bool = True   # WeightedRandomSampler on train
-
-    # LoRA — see model.LoraSpec
-    lora: bool = False
-    lora_r: int = 16
-    lora_alpha: int = 32
-    lora_dropout: float = 0.05
-    lora_target_modules: str = "query,value,query_global,value_global"
-    lora_freeze_depth: int = 0      # 0 = LoRA on all 12 layers; K = layers <K fully frozen, LoRA on layers >=K
-
-    # Frozen-activation cache (only valid when lora=True and lora_freeze_depth>0)
-    activation_cache: bool = False
-    activation_cache_dir: str = ""
 
 
 def load_config(cli: argparse.Namespace) -> Config:
@@ -149,26 +137,6 @@ def set_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
-
-def _forward_kwargs(batch: dict) -> dict:
-    """Build kwargs for model.forward from a batch.
-
-    When the dataset yields cached_hidden (activation_cache=True), the model
-    routes through the partial-encoder path. The full-input fields are still
-    needed because the partial path reads attention_mask + global_attention_mask
-    to rebuild the extended mask.
-    """
-    out = {
-        "attention_mask": batch["attention_mask"],
-        "global_attention_mask": batch["global_attention_mask"],
-    }
-    if "cached_hidden" in batch:
-        out["cached_hidden"] = batch["cached_hidden"]
-    else:
-        out["input_ids"] = batch["input_ids"]
-        out["token_type_ids"] = batch["token_type_ids"]
-    return out
 
 
 def linear_warmup_linear_decay(optimizer, num_warmup: int, num_total: int):
@@ -202,10 +170,15 @@ def evaluate(
     device,
     max_batches: int | None = None,
     bf16: bool = True,
+    languages: list[str] | None = None,
 ) -> dict:
-    """Run validation/test eval. Uses bf16 autocast on CUDA when bf16=True so
-    eval throughput matches training throughput (otherwise fp32 eval ends up
-    ~2x slower per token)."""
+    """Run validation/test eval. Uses bf16 autocast on CUDA when bf16=True.
+
+    If `languages` is provided, it must list the language string for each
+    *row* in the underlying dataset in the same order the loader emits them
+    (i.e. shuffle=False). When given, the returned metrics dict carries a
+    `per_language` field via metrics.pointwise_metrics_per_language.
+    """
     from contextlib import nullcontext
     model.eval()
     all_preds: list[int] = []
@@ -221,12 +194,23 @@ def evaluate(
             if max_batches is not None and i >= max_batches:
                 break
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-            logits = model(**_forward_kwargs(batch))
+            logits = model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                global_attention_mask=batch["global_attention_mask"],
+                token_type_ids=batch["token_type_ids"],
+            )
             preds = logits.argmax(dim=-1).cpu().tolist()
             labels = batch["labels"].cpu().tolist()
             all_preds.extend(preds)
             all_labels.extend(labels)
     iterable.close() if hasattr(iterable, "close") else None
+    if languages is not None:
+        if len(languages) != len(all_preds):
+            # Loader produced fewer/more rows than expected (max_batches truncated
+            # or dataset path mismatch). Fall back to language-blind metrics.
+            return pointwise_metrics(all_preds, all_labels)
+        return pointwise_metrics_per_language(all_preds, all_labels, languages)
     return pointwise_metrics(all_preds, all_labels)
 
 
@@ -307,23 +291,6 @@ def main() -> int:
                     help="WeightedRandomSampler on train set (default on)")
     ap.add_argument("--no_balanced_sampler", dest="balanced_sampler", action="store_false",
                     help="Plain shuffled sampler; rely only on loss class weights")
-    ap.add_argument("--lora", action="store_true", default=None,
-                    help="Enable LoRA finetuning. Frozen base + low-rank adapters on Q+V projections.")
-    ap.add_argument("--no_lora", dest="lora", action="store_false")
-    ap.add_argument("--lora_r", type=int, default=None)
-    ap.add_argument("--lora_alpha", type=int, default=None)
-    ap.add_argument("--lora_dropout", type=float, default=None)
-    ap.add_argument("--lora_target_modules", default=None,
-                    help="csv list of target module names (default: query,value,query_global,value_global)")
-    ap.add_argument("--lora_freeze_depth", type=int, default=None,
-                    help="0 = LoRA on all layers; K = layers 0..K-1 fully frozen, LoRA on K..11.")
-    ap.add_argument("--activation_cache", action="store_true", default=None,
-                    help="Read frozen-prefix activations from cache; partial encoder forward "
-                         "from layer lora_freeze_depth. Requires the cache to be prewarmed by "
-                         "cache_activations.py.")
-    ap.add_argument("--no_activation_cache", dest="activation_cache", action="store_false")
-    ap.add_argument("--activation_cache_dir", default=None,
-                    help="Override the activation cache root.")
     args = ap.parse_args()
 
     cfg = load_config(args)
@@ -353,29 +320,11 @@ def main() -> int:
     logger.info("data paths: train=%s val=%s test=%s", train_path, val_path, test_path)
 
     logger.info("loading datasets from %s ...", data_root)
-    if cfg.activation_cache and not (cfg.lora and cfg.lora_freeze_depth > 0):
-        raise ValueError(
-            "--activation_cache requires --lora --lora_freeze_depth K (K>0). "
-            "Cached activations are only meaningful when the bottom K layers "
-            "are fully frozen."
-        )
-
-    activation_cfg = None
-    if cfg.activation_cache:
-        from data import ActivationCacheConfig
-        activation_cfg = ActivationCacheConfig(
-            model_name=cfg.model_name,
-            freeze_depth=cfg.lora_freeze_depth,
-            cache_dir=cfg.activation_cache_dir or None,
-        )
-        logger.info("activation cache enabled: %s", activation_cfg)
-
     ds_kwargs = dict(
         tokenizer=tokenizer,
         max_seq_len=cfg.max_seq_len,
         bridge_stride=cfg.bridge_stride,
         cache_dir=cfg.cache_dir or None,
-        activation_cache=activation_cfg,
     )
     train_ds = DS(train_path, **ds_kwargs)
     val_ds = DS(val_path, **ds_kwargs)
@@ -401,29 +350,57 @@ def main() -> int:
         prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
     )
 
-    # Balanced sampling: inverse-frequency over-sampling so every batch is ~class-balanced.
-    # Complementary to class_weights in loss (both can be on).
+    # Balanced sampling: inverse-frequency over-sampling per (language, label)
+    # so every batch is ~balanced both across complexity classes and across
+    # languages. If the parquet doesn't carry a `language` column (legacy
+    # Python-only datasets), we fall back to label-only weighting.
     train_sampler = None
     train_shuffle = True
     if cfg.balanced_sampler:
         import pyarrow.parquet as _pq
-        labels_raw = _pq.read_table(train_path).column("label").to_pylist()
         from common.labels import LABEL_TO_IDX
-        counts: dict[int, int] = {}
-        for lab in labels_raw:
-            i = LABEL_TO_IDX[lab]; counts[i] = counts.get(i, 0) + 1
-        per_class_weight = {i: 1.0 / max(1, counts.get(i, 1)) for i in counts}
-        sample_weights = [per_class_weight[LABEL_TO_IDX[l]] for l in labels_raw]
+        tbl = _pq.read_table(train_path)
+        labels_raw = tbl.column("label").to_pylist()
+        if "language" in tbl.column_names:
+            langs_raw = tbl.column("language").to_pylist()
+        else:
+            langs_raw = ["python"] * len(labels_raw)
+        cell_counts: dict[tuple[str, str], int] = {}
+        for lang, lab in zip(langs_raw, labels_raw):
+            cell_counts[(lang, lab)] = cell_counts.get((lang, lab), 0) + 1
+        cell_weight = {k: 1.0 / max(1, v) for k, v in cell_counts.items()}
+        sample_weights = [cell_weight[(lang, lab)]
+                          for lang, lab in zip(langs_raw, labels_raw)]
         train_sampler = WeightedRandomSampler(
             sample_weights, num_samples=len(sample_weights), replacement=True,
         )
         train_shuffle = False
-        logger.info("balanced sampler: per-class counts %s", dict(sorted(counts.items())))
+        n_cells = len(cell_counts)
+        n_langs = len({k[0] for k in cell_counts})
+        logger.info("balanced sampler: %d cells across %d languages", n_cells, n_langs)
+        # Per-class summary
+        from common.labels import POINT_LABELS as _PL
+        for lab in _PL:
+            cnt = sum(v for (l, lb), v in cell_counts.items() if lb == lab)
+            logger.info("  %-24s %d", lab, cnt)
 
     dl_train = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=train_shuffle,
                           sampler=train_sampler, **dl_kwargs)
     dl_val = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False, **dl_kwargs)
     dl_test = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False, **dl_kwargs)
+
+    # Per-language slice tracking for eval. Loaders are shuffle=False so row
+    # order matches the parquet → we can zip preds against this list.
+    def _languages_in_order(ds) -> list[str]:
+        # PointDataset stores languages on `_langs`; Subsets in dry-run mode
+        # need careful unwrap.
+        from torch.utils.data import Subset
+        if isinstance(ds, Subset):
+            base = ds.dataset
+            return [base._langs[i] for i in ds.indices]
+        return list(getattr(ds, "_langs", []))
+    val_languages = _languages_in_order(val_ds)
+    test_languages = _languages_in_order(test_ds)
     logger.info("DataLoader: bs=%d num_workers=%d prefetch_factor=%d pin_memory=%s "
                 "balanced_sampler=%s",
                 cfg.batch_size, cfg.num_workers, cfg.prefetch_factor,
@@ -431,15 +408,8 @@ def main() -> int:
                 train_sampler is not None)
 
     # --- model -----
-    from model import LoraSpec
-    lora_spec = LoraSpec(
-        enabled=cfg.lora,
-        r=cfg.lora_r, alpha=cfg.lora_alpha, dropout=cfg.lora_dropout,
-        target_modules=tuple(s.strip() for s in cfg.lora_target_modules.split(",") if s.strip()),
-        freeze_depth=cfg.lora_freeze_depth,
-    )
-    logger.info("building model (%s, lora=%s) ...", cfg.model_name, lora_spec.to_dict())
-    model = build_model(cfg.model_name, lora=lora_spec)
+    logger.info("building model (%s) ...", cfg.model_name)
+    model = build_model(cfg.model_name)
     logger.info("moving model to %s ...", device)
     model = model.to(device)
     n_params = sum(p.numel() for p in model.parameters())
@@ -455,9 +425,6 @@ def main() -> int:
     loss_fn = nn.CrossEntropyLoss(weight=weights, label_smoothing=cfg.label_smoothing)
 
     # --- optim / sched -----
-    # Only register parameters that will actually receive grads — frozen
-    # base weights (LoRA) and any layers below freeze_depth must not enter
-    # the optimizer state.
     no_decay = ("bias", "LayerNorm.weight")
     trainable = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     grouped = [
@@ -517,7 +484,12 @@ def main() -> int:
             )
             for local_step, batch in enumerate(pbar):
                 batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-                kwargs = _forward_kwargs(batch)
+                kwargs = dict(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    global_attention_mask=batch["global_attention_mask"],
+                    token_type_ids=batch["token_type_ids"],
+                )
                 if use_bf16:
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                         logits = model(**kwargs)
@@ -544,7 +516,8 @@ def main() -> int:
                         logger.info("epoch=%d step=%d lr=%.2e loss=%.4f",
                                     epoch, step, scheduler.get_last_lr()[0], loss_val)
                     if step > 0 and step % cfg.eval_every_steps == 0:
-                        met = evaluate(model, dl_val, device, bf16=cfg.bf16)
+                        met = evaluate(model, dl_val, device, bf16=cfg.bf16,
+                                       languages=val_languages)
                         rec = {"step": step, "epoch": epoch, "split": "val", **_log_safe(met)}
                         metrics_log.write(json.dumps(rec) + "\n"); metrics_log.flush()
                         loss_log.flush()
@@ -569,7 +542,8 @@ def main() -> int:
                                             step, best_f1, best_epoch)
                                 save_state(model, optimizer, scheduler, scaler, step, epoch, out_root / "last")
                                 metrics_log.close(); loss_log.close()
-                                return _final_report(model, dl_test, device, out_root, cfg)
+                                return _final_report(model, dl_test, device, out_root, cfg,
+                                                      test_languages=test_languages)
                         model.train()
 
             pbar.close()
@@ -581,7 +555,8 @@ def main() -> int:
 
     metrics_log.close(); loss_log.close()
     logger.info("training complete (best macro_f1=%.4f @ epoch %d)", best_f1, best_epoch)
-    return _final_report(model, dl_test, device, out_root, cfg)
+    return _final_report(model, dl_test, device, out_root, cfg,
+                          test_languages=test_languages)
 
 
 def _log_safe(met: dict) -> dict:
@@ -590,28 +565,42 @@ def _log_safe(met: dict) -> dict:
     for k, v in met.items():
         if isinstance(v, (int, float)):
             flat[k] = v
-    # Flatten per-class F1s too
+    # Flatten per-class F1s
     for cls, stats in met.get("per_class", {}).items():
         flat[f"f1[{cls}]"] = stats["f1"]
+    # Flatten per-language headlines
+    for lang, lm in met.get("per_language", {}).items():
+        flat[f"acc[{lang}]"] = lm.get("accuracy", 0.0)
+        flat[f"f1[{lang}]"] = lm.get("macro_f1", 0.0)
+        flat[f"w1[{lang}]"] = lm.get("within_1_tier_accuracy", 0.0)
+        flat[f"n[{lang}]"] = lm.get("n", 0)
     return flat
 
 
-def _final_report(model, dl_test, device, out_root: Path, cfg: Config) -> int:
+def _final_report(model, dl_test, device, out_root: Path, cfg: Config,
+                   test_languages: list[str] | None = None) -> int:
     best_dir = out_root / "best"
     if best_dir.exists() and (best_dir / "codebert_meta.json").exists():
-        # Restore the val-F1-best model. Either layout (full-FT pytorch_model.bin
-        # or LoRA adapter/+classifier.pt) is handled by load_checkpoint.
         from model import LongCoderClassifier
         model = LongCoderClassifier.load_checkpoint(best_dir).to(device)
-    met = evaluate(model, dl_test, device, bf16=cfg.bf16)
+    met = evaluate(model, dl_test, device, bf16=cfg.bf16, languages=test_languages)
     met["seed"] = cfg.seed
     met["task"] = "point"
     (out_root / "test_metrics.json").write_text(json.dumps(met, indent=2), encoding="utf-8")
     logger.info("=== TEST METRICS ===")
     logger.info("accuracy=%.4f macro_f1=%.4f", met["accuracy"], met["macro_f1"])
     logger.info("within_1_tier_accuracy=%.4f", met["within_1_tier_accuracy"])
+    if "per_language" in met:
+        logger.info("--- per-language breakdown ---")
+        # Order rows from worst macro-F1 to best so collapses bubble to the top.
+        rows = sorted(met["per_language"].items(),
+                       key=lambda kv: kv[1].get("macro_f1", 0.0))
+        for lang, lm in rows:
+            logger.info("  %-12s n=%-4d acc=%.4f macro_f1=%.4f w1=%.4f",
+                        lang, lm.get("n", 0), lm.get("accuracy", 0.0),
+                        lm.get("macro_f1", 0.0),
+                        lm.get("within_1_tier_accuracy", 0.0))
     logger.info("\n%s", pretty_confusion(met["confusion_matrix"], POINT_LABELS))
-    # Auto-plot (best-effort; matplotlib may be absent)
     try:
         from plot_metrics import plot_all as _plot_all
         _plot_all(out_root)

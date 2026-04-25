@@ -26,16 +26,24 @@ def _pointwise_stats(path: Path, samples_per_class: int) -> dict:
     by_class: dict[str, int] = defaultdict(int)
     by_split: dict[str, int] = defaultdict(int)
     by_source: dict[str, int] = defaultdict(int)
+    by_lang: dict[str, int] = defaultdict(int)
     by_split_class: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    by_lang_class: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    by_split_lang: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     examples: dict[str, list[dict]] = defaultdict(list)
     for r in rows:
+        lang = r.get("language") or "unknown"
         by_class[r["label"]] += 1
         by_split[r["split"]] += 1
         by_source[r["source"]] += 1
+        by_lang[lang] += 1
         by_split_class[r["split"]][r["label"]] += 1
+        by_lang_class[lang][r["label"]] += 1
+        by_split_lang[r["split"]][lang] += 1
         if len(examples[r["label"]]) < samples_per_class:
             examples[r["label"]].append({
                 "source": r["source"],
+                "language": lang,
                 "problem_id": r["problem_id"],
                 "code_prefix": (r["code"] or "")[:220],
             })
@@ -45,7 +53,10 @@ def _pointwise_stats(path: Path, samples_per_class: int) -> dict:
         "by_class": dict(by_class),
         "by_split": dict(by_split),
         "by_source": dict(by_source),
+        "by_language": dict(by_lang),
         "by_split_class": {s: dict(c) for s, c in by_split_class.items()},
+        "by_language_class": {l: dict(c) for l, c in by_lang_class.items()},
+        "by_split_language": {s: dict(c) for s, c in by_split_lang.items()},
         "examples": dict(examples),
     }
 
@@ -88,7 +99,7 @@ def main() -> int:
         "pairwise": _pairwise_stats(Path(args.pairwise)),
     }
 
-    # Thin-class alert
+    # Thin-class alert (overall)
     thin: list[dict] = []
     p = stats["pointwise"]
     if p.get("found"):
@@ -97,6 +108,31 @@ def main() -> int:
             if n < 200:
                 thin.append({"label": lab, "count": n})
     stats["thin_classes_warning"] = thin
+
+    # Per-(language, class) thin-cell alert
+    thin_cells: list[dict] = []
+    if p.get("found"):
+        for lang, by_lab in p.get("by_language_class", {}).items():
+            for lab in POINT_LABELS:
+                n = by_lab.get(lab, 0)
+                if n < 30:
+                    thin_cells.append({"language": lang, "label": lab, "count": n})
+    stats["thin_cells_warning"] = thin_cells
+
+    # Cross-language problem-id leakage check (pid in multiple splits would mean leakage)
+    leakage: list[dict] = []
+    if p.get("found"):
+        rows = pq.read_table(args.pointwise).to_pylist()
+        from collections import defaultdict as _dd
+        pid_splits: _dd = _dd(set)
+        for r in rows:
+            if r.get("problem_id"):
+                pid_splits[r["problem_id"]].add(r["split"])
+        for pid, splits in pid_splits.items():
+            if len(splits) > 1:
+                leakage.append({"problem_id": pid, "splits": sorted(splits)})
+    stats["cross_split_leakage"] = leakage[:50]
+    stats["cross_split_leakage_count"] = len(leakage)
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -112,6 +148,18 @@ def main() -> int:
             print(f"  {lab:<24} {p['by_class'].get(lab, 0):>5}{mark}", flush=True)
         print(f"Pointwise by split: {p['by_split']}", flush=True)
         print(f"Pointwise by source: {p['by_source']}", flush=True)
+        print(f"Pointwise by language: {p['by_language']}", flush=True)
+        if p.get("by_split_language"):
+            print("Pointwise by (split, language):")
+            for sp in ("train", "val", "test"):
+                if sp in p["by_split_language"]:
+                    print(f"  {sp:<5} {dict(sorted(p['by_split_language'][sp].items()))}", flush=True)
+        if stats.get("cross_split_leakage_count"):
+            print(f"[ALERT] cross-split problem_id leakage: "
+                  f"{stats['cross_split_leakage_count']} pids", flush=True)
+        if stats.get("thin_cells_warning"):
+            n = len(stats["thin_cells_warning"])
+            print(f"[WARN] thin (language, label) cells: {n} (see stats.json)", flush=True)
     pw = stats["pairwise"]
     if pw.get("found"):
         print(f"\nPairwise total: {pw['total']}", flush=True)

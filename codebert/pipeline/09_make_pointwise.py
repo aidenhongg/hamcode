@@ -33,6 +33,7 @@ def main() -> int:
             rows.append({
                 "id": (r.get("code_sha256") or str(i))[:16] + f"-{i:06d}",
                 "source": r.get("source") or "unknown",
+                "language": r.get("language") or "python",
                 "problem_id": r.get("problem_id"),
                 "solution_idx": int(r.get("solution_idx") or 0),
                 "code": r.get("code") or "",

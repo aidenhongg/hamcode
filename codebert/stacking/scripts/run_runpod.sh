@@ -56,10 +56,8 @@ export HF_HUB_DOWNLOAD_TIMEOUT=30
 SKIP_DATA=0
 SKIP_ENCODER_SWEEP=0
 SKIP_HEAD_HP=0
-SKIP_LORA_HP=0
 HP_TRIALS=40
 HP_HEADS="xgb,lgbm,mlp,stacked"
-LORA_HP_TRIALS=16
 N_FOLDS=5
 ENCODER_CONFIG="stacking/configs/encoder_sweep.yaml"
 EXTRACTION_DIR="runs/heads/extraction"
@@ -70,10 +68,8 @@ while [ $# -gt 0 ]; do
         --skip-data) SKIP_DATA=1 ;;
         --skip-encoder-sweep) SKIP_ENCODER_SWEEP=1 ;;
         --skip-head-hp) SKIP_HEAD_HP=1 ;;
-        --skip-lora-hp) SKIP_LORA_HP=1 ;;
         --hp-trials) HP_TRIALS="$2"; shift ;;
         --hp-heads) HP_HEADS="$2"; shift ;;
-        --lora-hp-trials) LORA_HP_TRIALS="$2"; shift ;;
         --encoder-config) ENCODER_CONFIG="$2"; shift ;;
         --n_folds) N_FOLDS="$2"; shift ;;
         --extraction_dir) EXTRACTION_DIR="$2"; shift ;;
@@ -146,7 +142,7 @@ python -m stacking.features.ast_features \
     --out_dir "$EXTRACTION_DIR"
 
 if [ "$SKIP_ENCODER_SWEEP" -eq 0 ]; then
-    echo "=== [4/6] Encoder recipe sweep (recipes A + B from $ENCODER_CONFIG) ==="
+    echo "=== [4/5] Encoder recipe sweep ($ENCODER_CONFIG) ==="
     # Iterates each recipe: (optional cache prewarm) -> OOF -> semantic -> head sweep.
     # Resume-aware: recipes whose <out_root>/<recipe>/SUMMARY.md exists are skipped.
     python -m stacking.encoder_sweep \
@@ -155,7 +151,7 @@ if [ "$SKIP_ENCODER_SWEEP" -eq 0 ]; then
         --out_root "$OUT_ROOT" \
         --extraction_root "$EXTRACTION_DIR"
 else
-    echo "=== [4/6] Skipping encoder sweep (--skip-encoder-sweep) ==="
+    echo "=== [4/5] Skipping encoder sweep (--skip-encoder-sweep) ==="
 fi
 
 WINNER_FILE="$OUT_ROOT/ENCODER_WINNER.json"
@@ -167,7 +163,7 @@ WINNER=$(python -c "import json; print(json.load(open('$WINNER_FILE'))['name'])"
 echo "[runpod] winner: $WINNER"
 
 if [ "$SKIP_HEAD_HP" -eq 0 ]; then
-    echo "=== [5/6] Head HP search on winner ($WINNER), $HP_TRIALS trials per head ==="
+    echo "=== [5/5] Head HP search on winner ($WINNER), $HP_TRIALS trials per head ==="
     # TPE + median pruner over head-specific search spaces. Best HPs re-run
     # at 3 seeds on the test set to report mean +/- std.
     python -m stacking.hp_search \
@@ -178,19 +174,7 @@ if [ "$SKIP_HEAD_HP" -eq 0 ]; then
         --extraction_dir "$EXTRACTION_DIR/$WINNER" \
         --out_root "$OUT_ROOT/$WINNER/hp"
 else
-    echo "=== [5/6] Skipping head HP search (--skip-head-hp) ==="
-fi
-
-if [ "$SKIP_LORA_HP" -eq 0 ]; then
-    echo "=== [6/6] LoRA HP search on winner ($WINNER), $LORA_HP_TRIALS trials ==="
-    python -m stacking.lora_hp_search \
-        --config "$ENCODER_CONFIG" \
-        --base_recipe "$WINNER" \
-        --data_dir data/processed \
-        --out_root "$OUT_ROOT/lora_hp" \
-        --trials "$LORA_HP_TRIALS"
-else
-    echo "=== [6/6] Skipping LoRA HP search (--skip-lora-hp) ==="
+    echo "=== [5/5] Skipping head HP search (--skip-head-hp) ==="
 fi
 
 echo ""
@@ -199,5 +183,4 @@ echo "Encoder sweep:    $OUT_ROOT/ENCODER_SUMMARY.md"
 echo "Encoder winner:   $OUT_ROOT/ENCODER_WINNER.json -> $WINNER"
 echo "Per-recipe heads: $OUT_ROOT/<recipe>/SUMMARY.md"
 echo "Head HP search:   $OUT_ROOT/$WINNER/hp/HP_SUMMARY.md"
-echo "LoRA HP search:   $OUT_ROOT/lora_hp/$WINNER/best_params.json"
 echo "OOF artifacts:    $EXTRACTION_DIR/<recipe>/oof/"

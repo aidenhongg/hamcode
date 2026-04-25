@@ -1,25 +1,18 @@
-"""AST + cyclomatic feature extraction for Python code snippets.
+"""AST + cyclomatic feature extraction for code snippets, multi-language.
 
-Uses the stdlib `ast` module (reliable, deterministic) plus `radon` for
-McCabe cyclomatic complexity. The fallback on SyntaxError mirrors the
-existing `data.py:extract_dataflow` contract: return zero vector.
-
-The per-snippet feature vector has a fixed schema (see FEATURES below).
-`extract_differenced(code_a, code_b)` returns a pair-level vector combining
-raw A, raw B, signed diff, and |diff| for each feature — giving 4x the
-per-snippet dimensionality (minus the redundant |diff| for strict booleans,
-which we still emit for schema stability).
+Uses tree-sitter per language (via common.parsers) instead of stdlib `ast`.
+The 21-feature schema is unchanged from the Python-only version; per-language
+visitors map each canonical feature to the right grammar's node-kinds.
 
 CLI:
-    python -m stacking.features.ast_features \
-        --in_splits data/processed \
+    python -m stacking.features.ast_features \\
+        --in_splits data/processed \\
         --out_dir runs/heads/extraction
 """
 
 from __future__ import annotations
 
 import argparse
-import ast
 import json
 import sys
 import warnings
@@ -34,25 +27,24 @@ from tqdm.auto import tqdm
 
 warnings.filterwarnings("ignore", category=SyntaxWarning)
 
-try:
-    from radon.complexity import cc_visit
-except ImportError as e:  # pragma: no cover
-    raise RuntimeError("radon is required: pip install radon") from e
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from common.parsers import (
+    parse, walk,
+    LOOP_NODE_KINDS, IF_NODE_KINDS, SWITCH_NODE_KINDS,
+    DECISION_NODE_KINDS, FUNCTION_NODE_KINDS, BREAK_NODE_KINDS,
+    JUMP_NODE_KINDS,
+)
 
 
-# Ordered feature schema. Must stay stable across runs (downstream scaler
-# and head expect a fixed column order).
-#
-# Categories:
-#   count:   non-negative integer — will be log1p'd + z-scored downstream
-#   bool:    0/1 — kept raw, differencing yields {-1, 0, 1}
-#   cont:    continuous float — z-scored downstream
+# Ordered feature schema. Stays stable across runs and across languages
+# (same names, same dimensionality; per-language visitors compute each).
 FEATURES: tuple[tuple[str, str], ...] = (
     ("no_of_ifs",               "count"),
-    ("no_of_switches",          "count"),   # Python 3.10 `match` counted here
+    ("no_of_switches",          "count"),
     ("no_of_loop",              "count"),
     ("no_of_break",             "count"),
-    ("nested_loop_depth",       "count"),   # strongest signal (user notes 62% alone)
+    ("nested_loop_depth",       "count"),
     ("noOfMethods",             "count"),
     ("noOfVariables",           "count"),
     ("noOfStatements",          "count"),
@@ -74,159 +66,223 @@ FEATURE_NAMES: tuple[str, ...] = tuple(name for name, _ in FEATURES)
 FEATURE_KIND: dict[str, str] = dict(FEATURES)
 N_FEATURES = len(FEATURES)
 
-# Identifiers that imply specific data structures / ops when imported/called.
-_PQ_HINTS = {"heapq", "heappush", "heappop", "heapify", "heappushpop", "PriorityQueue"}
-_HSET_CALLS = {"set", "frozenset"}
-_HMAP_CALLS = {"dict", "defaultdict", "OrderedDict", "Counter", "ChainMap"}
-_SORT_CALLS = {"sorted", "sort"}  # .sort method on lists also counted
+
+# ---------------------------------------------------------------------------
+# Per-language regex/text-level hint sets for the "presence" features. We
+# don't try to walk every grammar's import tree; we just regex the source for
+# distinctive identifier names that imply use of priority queues / hash sets /
+# hash maps / sorts.
+# ---------------------------------------------------------------------------
+
+_PQ_TOKENS: dict[str, tuple[str, ...]] = {
+    "python":     ("heapq", "heappush", "heappop", "heapify", "PriorityQueue"),
+    "java":       ("PriorityQueue", "Heap"),
+    "cpp":        ("priority_queue", "make_heap", "push_heap", "pop_heap"),
+    "c":          ("heap_push", "heap_pop", "heapify"),
+    "csharp":     ("PriorityQueue", "Heap"),
+    "go":         ("heap.Push", "heap.Pop", "heap.Init", "container/heap"),
+    "javascript": ("PriorityQueue", "MinHeap", "MaxHeap", "Heap"),
+    "typescript": ("PriorityQueue", "MinHeap", "MaxHeap", "Heap"),
+    "php":        ("SplPriorityQueue", "SplHeap"),
+    "ruby":       ("PriorityQueue", "Heap"),
+    "rust":       ("BinaryHeap",),
+    "swift":      ("Heap", "PriorityQueue"),
+}
+
+_HSET_TOKENS: dict[str, tuple[str, ...]] = {
+    "python":     ("set(", "frozenset(", "{ "),  # set literals are ambiguous; light hint
+    "java":       ("HashSet", "TreeSet", "LinkedHashSet"),
+    "cpp":        ("unordered_set", "set<"),
+    "c":          ("hashset", "set_t"),
+    "csharp":     ("HashSet", "SortedSet"),
+    "go":         ("map[", "set", "struct{}"),  # Go uses map[T]struct{} idiom
+    "javascript": ("new Set(",),
+    "typescript": ("new Set(",),
+    "php":        ("array_unique", "SplObjectStorage"),
+    "ruby":       ("Set.new", "require 'set'"),
+    "rust":       ("HashSet", "BTreeSet"),
+    "swift":      ("Set<", "Set("),
+}
+
+_HMAP_TOKENS: dict[str, tuple[str, ...]] = {
+    "python":     ("dict(", "defaultdict", "OrderedDict", "Counter", "{}"),
+    "java":       ("HashMap", "TreeMap", "LinkedHashMap"),
+    "cpp":        ("unordered_map", "map<"),
+    "c":          ("hashmap", "map_t"),
+    "csharp":     ("Dictionary<", "Hashtable"),
+    "go":         ("map[",),
+    "javascript": ("new Map(", "Object.create", "{}"),
+    "typescript": ("new Map(", "Record<"),
+    "php":        ("array(",),
+    "ruby":       ("{}", "Hash.new"),
+    "rust":       ("HashMap", "BTreeMap"),
+    "swift":      ("[", ":"),  # weak hint; Swift dict literals use [k: v]
+}
+
+_SORT_TOKENS: dict[str, tuple[str, ...]] = {
+    "python":     ("sorted(", ".sort(", "sort("),
+    "java":       ("Collections.sort", "Arrays.sort", ".sort("),
+    "cpp":        ("std::sort", "sort("),
+    "c":          ("qsort",),
+    "csharp":     ("Array.Sort", "OrderBy", ".Sort("),
+    "go":         ("sort.Sort", "sort.Slice", "sort.Ints", "sort.Strings"),
+    "javascript": (".sort(",),
+    "typescript": (".sort(",),
+    "php":        ("sort(", "asort(", "ksort(", "usort("),
+    "ruby":       (".sort", "sort_by"),
+    "rust":       (".sort(", ".sort_by(", ".sort_unstable("),
+    "swift":      (".sort(", ".sorted(", "sorted("),
+}
 
 
-def _is_loop(node: ast.AST) -> bool:
-    return isinstance(node, (ast.For, ast.AsyncFor, ast.While, ast.comprehension))
+def _has_token(code: str, tokens: tuple[str, ...]) -> bool:
+    return any(t in code for t in tokens)
 
 
-def _is_cond(node: ast.AST) -> bool:
-    # `match` goes here too — we count it under no_of_switches *and* treat it
-    # structurally like a multi-way branch for the nesting heuristics.
-    if isinstance(node, ast.If):
-        return True
-    if hasattr(ast, "Match") and isinstance(node, ast.Match):
-        return True
-    return False
+def _count_token(code: str, tokens: tuple[str, ...]) -> int:
+    return sum(code.count(t) for t in tokens)
 
 
-def _nested_loop_depth(root: ast.AST) -> int:
-    """Max depth of nested loops in the AST."""
+# ---------------------------------------------------------------------------
+# Tree-sitter helpers
+# ---------------------------------------------------------------------------
+
+def _is_node_in(node, kinds: frozenset[str]) -> bool:
+    return node.type in kinds
+
+
+def _nested_depth(root, kinds: frozenset[str]) -> int:
+    """Max stack depth of nodes in `kinds` along any root-to-leaf path."""
+    if not kinds:
+        return 0
     max_depth = 0
 
-    def walk(node: ast.AST, depth: int) -> None:
+    def visit(node, depth: int) -> None:
         nonlocal max_depth
-        new_depth = depth + 1 if _is_loop(node) else depth
-        max_depth = max(max_depth, new_depth)
-        for child in ast.iter_child_nodes(node):
-            walk(child, new_depth)
+        new_depth = depth + 1 if node.type in kinds else depth
+        if new_depth > max_depth:
+            max_depth = new_depth
+        for c in node.children:
+            visit(c, new_depth)
 
-    walk(root, 0)
+    visit(root, 0)
     return max_depth
 
 
-def _count_nested_cooccurrence(root: ast.AST, outer_pred, inner_pred) -> int:
-    """Count occurrences of `inner_pred` nodes inside `outer_pred` ancestors."""
+def _count_nested_cooccurrence(root, outer_kinds: frozenset[str],
+                               inner_kinds: frozenset[str]) -> int:
+    """Count occurrences of inner-kind nodes inside an outer-kind ancestor."""
+    if not outer_kinds or not inner_kinds:
+        return 0
     count = 0
 
-    def walk(node: ast.AST, inside_outer: bool) -> None:
+    def visit(node, depth_outer: int) -> None:
         nonlocal count
-        is_outer = outer_pred(node)
-        is_inner = inner_pred(node)
-        # Count this node if it's an inner and an outer ancestor exists.
-        # For outer==inner (e.g., loop_in_loop), only count when INSIDE an existing outer.
-        if is_inner and inside_outer and not (outer_pred is inner_pred and node is _ROOT):
+        is_outer = node.type in outer_kinds
+        is_inner = node.type in inner_kinds
+        # Self-nesting (loop_in_loop, cond_in_cond): only count when an outer
+        # ancestor already exists, i.e. depth_outer > 0.
+        if is_inner and depth_outer > 0:
             count += 1
-        new_inside = inside_outer or is_outer
-        for child in ast.iter_child_nodes(node):
-            walk(child, new_inside)
+        new_depth = depth_outer + 1 if is_outer else depth_outer
+        for c in node.children:
+            visit(c, new_depth)
 
-    walk(root, False)
+    visit(root, 0)
     return count
 
 
-_ROOT = object()  # sentinel — never actually reached
+def _count_methods(root, kinds: frozenset[str]) -> int:
+    return sum(1 for n in walk(root) if n.type in kinds)
 
 
-def _extract_identifier(node: ast.AST) -> str | None:
-    """Pull a readable identifier from Attribute/Name for call-target analysis."""
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Attribute):
-        return node.attr
-    return None
+def _count_statements(root) -> int:
+    """Crude statement count: any node ending in `_statement` or named like a stmt."""
+    n = 0
+    for node in walk(root):
+        t = node.type
+        if t.endswith("_statement") or t in (
+            "expression_statement", "assignment", "assignment_expression",
+            "let_declaration", "var_declaration", "field_declaration",
+        ):
+            n += 1
+    return n
 
 
-def _collect_call_names(root: ast.AST) -> list[str]:
-    names: list[str] = []
-    for node in ast.walk(root):
-        if isinstance(node, ast.Call):
-            nm = _extract_identifier(node.func)
-            if nm:
-                names.append(nm)
-    return names
-
-
-def _collect_import_names(root: ast.AST) -> set[str]:
-    out: set[str] = set()
-    for node in ast.walk(root):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                out.add(alias.name.split(".")[0])
-                if alias.asname:
-                    out.add(alias.asname)
-        elif isinstance(node, ast.ImportFrom):
-            if node.module:
-                out.add(node.module.split(".")[0])
-            for alias in node.names:
-                out.add(alias.name)
-                if alias.asname:
-                    out.add(alias.asname)
-    return out
-
-
-def _detects_recursion(root: ast.AST) -> bool:
-    """True if any function body calls a function with its own name.
-
-    Catches direct recursion. Does not catch mutual recursion (e.g., a calls b
-    which calls a) — that's a known limitation; in practice direct is >95%.
-    """
-    for node in ast.walk(root):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            fn_name = node.name
-            for sub in ast.walk(node):
-                if isinstance(sub, ast.Call):
-                    nm = _extract_identifier(sub.func)
-                    if nm == fn_name:
-                        return True
+def _detects_recursion(root, fn_kinds: frozenset[str], src: bytes) -> bool:
+    """True if any function body references its own name."""
+    if not fn_kinds:
+        return False
+    for node in walk(root):
+        if node.type not in fn_kinds:
+            continue
+        # Find the identifier name within the function header
+        fname: str | None = None
+        for child in node.children:
+            if child.type in ("identifier", "name", "field_identifier",
+                              "property_identifier", "type_identifier"):
+                fname = src[child.start_byte:child.end_byte].decode("utf-8", "replace")
+                break
+        if not fname or len(fname) < 2:
+            continue
+        body = src[node.start_byte:node.end_byte].decode("utf-8", "replace")
+        # `fname` appears at least once for the declaration; recursion -> >= 2.
+        if body.count(fname) >= 2:
+            return True
     return False
 
 
-def _count_variables(root: ast.AST) -> int:
-    """Unique assignment targets (Name ids only — skips destructured tuples, etc.)."""
+def _count_variables(root, src: bytes) -> int:
+    """Approximate count of distinct identifier names that appear as
+    assignment targets. Uses a regex over identifier tokens — works across
+    languages without per-grammar AST surgery."""
+    import re
     names: set[str] = set()
-    for node in ast.walk(root):
-        if isinstance(node, ast.Assign):
-            for tgt in node.targets:
-                if isinstance(tgt, ast.Name):
-                    names.add(tgt.id)
-                elif isinstance(tgt, (ast.Tuple, ast.List)):
-                    for elt in tgt.elts:
-                        if isinstance(elt, ast.Name):
-                            names.add(elt.id)
-        elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
-            tgt = node.target
-            if isinstance(tgt, ast.Name):
-                names.add(tgt.id)
+    text = src.decode("utf-8", "replace")
+    # Patterns approximate per common syntax: `let x =`, `var x =`, `int x =`,
+    # `x =`, `x:`. We collect candidate identifiers preceding `=`.
+    for m in re.finditer(r"\b([A-Za-z_][A-Za-z_0-9]{0,30})\b\s*=(?!=)", text):
+        names.add(m.group(1))
+    # Reject obvious operator/keyword-like tokens; keep this list small.
+    names -= {"let", "var", "const", "if", "while", "for", "fn", "func",
+              "def", "return", "import", "from", "true", "false", "null",
+              "None", "True", "False", "this", "self"}
     return len(names)
 
 
-def _count_switch_like(root: ast.AST) -> int:
-    """Python 3.10+ `match` statements. Always 0 on <3.10."""
-    if not hasattr(ast, "Match"):
-        return 0
-    return sum(1 for n in ast.walk(root) if isinstance(n, ast.Match))
+def _cyclomatic(root, decision_kinds: frozenset[str],
+                fn_kinds: frozenset[str]) -> tuple[float, float, float]:
+    """McCabe-style cyclomatic complexity, computed per-function and aggregated.
 
-
-def _cyclomatic(code: str) -> tuple[float, float, float]:
-    """Return (max, sum, mean) of McCabe cyclomatic complexity across fns.
-
-    Returns (0.0, 0.0, 0.0) if no functions.
+    Per-function CC = 1 + (decision-point nodes inside the function body).
+    Returns (max, sum, mean). Returns (0, 0, 0) if no functions.
     """
-    try:
-        blocks = cc_visit(code)
-    except (SyntaxError, ValueError):
+    if not decision_kinds or not fn_kinds:
         return 0.0, 0.0, 0.0
-    vals = [float(b.complexity) for b in blocks]
-    if not vals:
-        return 0.0, 0.0, 0.0
-    return max(vals), sum(vals), float(np.mean(vals))
+    per_fn: list[int] = []
 
+    def count_decisions(node) -> int:
+        n = 0
+        for c in walk(node):
+            if c is node:
+                continue
+            if c.type in decision_kinds:
+                n += 1
+        return n
+
+    for node in walk(root):
+        if node.type not in fn_kinds:
+            continue
+        per_fn.append(1 + count_decisions(node))
+    if not per_fn:
+        return 0.0, 0.0, 0.0
+    arr = np.asarray(per_fn, dtype=np.float64)
+    return float(arr.max()), float(arr.sum()), float(arr.mean())
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 @dataclass
 class ASTFeatures:
@@ -240,92 +296,75 @@ class ASTFeatures:
         return {name: float(self.values[i]) for i, name in enumerate(FEATURE_NAMES)}
 
 
-def extract_features(code: str) -> ASTFeatures:
-    """Extract the fixed-schema AST feature vector from Python source.
+def extract_features(code: str, language: str = "python") -> ASTFeatures:
+    """Extract the fixed-schema AST feature vector from `code` in `language`.
 
-    On SyntaxError: return zeros (same fallback semantics as data.py).
+    On parse failure: zero vector (consistent with old fallback semantics).
     """
     if not code or not code.strip():
         return ASTFeatures.zero()
+
     try:
-        tree = ast.parse(code)
-    except SyntaxError:
+        tree = parse(language, code)
+    except Exception:
         return ASTFeatures.zero()
+    root = tree.root_node
+    src = code.encode("utf-8")
 
-    # Structural counts via single walk
-    n_if = 0
-    n_loop = 0
-    n_break = 0
-    n_methods = 0
-    n_statements = 0
-    n_jumps = 0
+    loop_k = LOOP_NODE_KINDS.get(language, frozenset())
+    if_k = IF_NODE_KINDS.get(language, frozenset())
+    switch_k = SWITCH_NODE_KINDS.get(language, frozenset())
+    dec_k = DECISION_NODE_KINDS.get(language, frozenset())
+    fn_k = FUNCTION_NODE_KINDS.get(language, frozenset())
+    brk_k = BREAK_NODE_KINDS.get(language, frozenset())
+    jmp_k = JUMP_NODE_KINDS.get(language, frozenset())
 
-    for node in ast.walk(tree):
-        if _is_cond(node):
+    # Single-pass counts
+    n_if = n_switch = n_loop = n_break = n_jump = 0
+    for node in walk(root):
+        t = node.type
+        if t in if_k:
             n_if += 1
-        if _is_loop(node):
+        if t in switch_k:
+            n_switch += 1
+        if t in loop_k:
             n_loop += 1
-        if isinstance(node, ast.Break):
+        if t in brk_k:
             n_break += 1
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            n_methods += 1
-        if isinstance(node, ast.stmt):
-            n_statements += 1
-        if isinstance(node, (ast.Break, ast.Continue, ast.Return, ast.Raise)):
-            n_jumps += 1
+        if t in jmp_k:
+            n_jump += 1
 
-    n_switches = _count_switch_like(tree)
-    n_vars = _count_variables(tree)
-    depth = _nested_loop_depth(tree)
-    recursion = 1 if _detects_recursion(tree) else 0
+    n_methods = _count_methods(root, fn_k)
+    n_statements = _count_statements(root)
+    n_vars = _count_variables(root, src)
+    depth = _nested_depth(root, loop_k)
+    recursion = 1 if _detects_recursion(root, fn_k, src) else 0
 
-    # Presence indicators from imports + call names
-    imports = _collect_import_names(tree)
-    calls = _collect_call_names(tree)
-    call_set = set(calls)
+    pq_present = 1 if _has_token(code, _PQ_TOKENS.get(language, ())) else 0
+    hset_present = 1 if _has_token(code, _HSET_TOKENS.get(language, ())) else 0
+    hmap_present = 1 if _has_token(code, _HMAP_TOKENS.get(language, ())) else 0
+    n_sort = _count_token(code, _SORT_TOKENS.get(language, ()))
 
-    pq_present = 1 if (imports & _PQ_HINTS) or (call_set & _PQ_HINTS) else 0
-    # Also detect dict/set literals directly.
-    hset_present = 0
-    hmap_present = 0
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Set) or isinstance(node, ast.SetComp):
-            hset_present = 1
-        if isinstance(node, ast.Dict) or isinstance(node, ast.DictComp):
-            hmap_present = 1
-    if (call_set & _HSET_CALLS) or ("set" in imports):
-        hset_present = 1
-    if (call_set & _HMAP_CALLS):
-        hmap_present = 1
+    # Cond-aware sets for nesting heuristics: union of if + switch
+    cond_k = if_k | switch_k
 
-    # Sort: count both sorted() calls AND .sort() method calls.
-    n_sort = 0
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            nm = _extract_identifier(node.func)
-            if nm in _SORT_CALLS:
-                n_sort += 1
-            # .sort() method
-            if isinstance(node.func, ast.Attribute) and node.func.attr == "sort":
-                n_sort += 1
+    cond_in_loop = _count_nested_cooccurrence(root, loop_k, cond_k)
+    loop_in_cond = _count_nested_cooccurrence(root, cond_k, loop_k)
+    loop_in_loop = _count_nested_cooccurrence(root, loop_k, loop_k)
+    cond_in_cond = _count_nested_cooccurrence(root, cond_k, cond_k)
 
-    cond_in_loop = _count_nested_cooccurrence(tree, _is_loop, _is_cond)
-    loop_in_cond = _count_nested_cooccurrence(tree, _is_cond, _is_loop)
-    loop_in_loop = _count_nested_cooccurrence(tree, _is_loop, _is_loop)
-    cond_in_cond = _count_nested_cooccurrence(tree, _is_cond, _is_cond)
-
-    cc_max, cc_sum, cc_mean = _cyclomatic(code)
+    cc_max, cc_sum, cc_mean = _cyclomatic(root, dec_k, fn_k)
 
     vec = np.array([
         n_if,
-        n_switches,
+        n_switch,
         n_loop,
         n_break,
         depth,
         n_methods,
         n_vars,
         n_statements,
-        n_jumps,
+        n_jump,
         recursion,
         pq_present,
         hset_present,
@@ -342,26 +381,22 @@ def extract_features(code: str) -> ASTFeatures:
     return ASTFeatures(values=vec)
 
 
-# -----------------------------------------------------------------------------
-# Pair differencing: produce raw A, raw B, B-A, |B-A| for each feature.
-# -----------------------------------------------------------------------------
-
 def diff_columns() -> list[str]:
-    """Column names for the differenced pair feature matrix."""
     out: list[str] = []
-    for name, kind in FEATURES:
+    for name, _kind in FEATURES:
         out.extend([f"ast_a__{name}", f"ast_b__{name}", f"ast_diff__{name}",
                     f"ast_abs_diff__{name}"])
     return out
 
 
-def extract_differenced(code_a: str, code_b: str) -> np.ndarray:
-    """Return a pair feature row: 4*N_FEATURES floats."""
-    fa = extract_features(code_a).values
-    fb = extract_features(code_b).values
+def extract_differenced(code_a: str, code_b: str, language: str = "python") -> np.ndarray:
+    """Pair feature row: 4*N_FEATURES floats. Both sides must share `language`
+    (within-language pairs only).
+    """
+    fa = extract_features(code_a, language).values
+    fb = extract_features(code_b, language).values
     diff = fb - fa
     absd = np.abs(diff)
-    # Interleave: [a0, b0, d0, |d0|, a1, b1, d1, |d1|, ...]
     out = np.empty(4 * N_FEATURES, dtype=np.float32)
     out[0::4] = fa
     out[1::4] = fb
@@ -370,33 +405,39 @@ def extract_differenced(code_a: str, code_b: str) -> np.ndarray:
     return out
 
 
-# -----------------------------------------------------------------------------
-# CLI: extract for all splits
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def _extract_pointwise_for_split(split_path: Path) -> tuple[list[str], np.ndarray]:
-    """Extract per-snippet features for a pointwise parquet."""
     tbl = pq.read_table(split_path)
-    codes: list[str] = tbl.column("code").to_pylist()
-    ids: list[str] = tbl.column("id").to_pylist()
-    mat = np.stack(
-        [extract_features(c).values for c in tqdm(codes, desc=f"ast:{split_path.stem}")],
-        axis=0,
-    )
+    codes = tbl.column("code").to_pylist()
+    ids = tbl.column("id").to_pylist()
+    if "language" in tbl.column_names:
+        langs = tbl.column("language").to_pylist()
+    else:
+        langs = ["python"] * len(codes)
+    rows: list[np.ndarray] = []
+    for code, lang in tqdm(list(zip(codes, langs)), desc=f"ast:{split_path.stem}"):
+        rows.append(extract_features(code, lang).values)
+    mat = np.stack(rows, axis=0) if rows else np.zeros((0, N_FEATURES), dtype=np.float32)
     return ids, mat
 
 
 def _extract_pairwise_for_split(split_path: Path) -> tuple[list[str], np.ndarray]:
-    """Extract differenced pair features for a pairwise parquet."""
     tbl = pq.read_table(split_path)
-    codes_a: list[str] = tbl.column("code_a").to_pylist()
-    codes_b: list[str] = tbl.column("code_b").to_pylist()
-    pair_ids: list[str] = tbl.column("pair_id").to_pylist()
-    mat = np.stack(
-        [extract_differenced(a, b) for a, b in tqdm(
-            list(zip(codes_a, codes_b)), desc=f"ast:{split_path.stem}")],
-        axis=0,
-    )
+    codes_a = tbl.column("code_a").to_pylist()
+    codes_b = tbl.column("code_b").to_pylist()
+    pair_ids = tbl.column("pair_id").to_pylist()
+    if "language" in tbl.column_names:
+        langs = tbl.column("language").to_pylist()
+    else:
+        langs = ["python"] * len(codes_a)
+    rows: list[np.ndarray] = []
+    for a, b, lang in tqdm(list(zip(codes_a, codes_b, langs)),
+                            desc=f"ast:{split_path.stem}"):
+        rows.append(extract_differenced(a, b, lang))
+    mat = np.stack(rows, axis=0) if rows else np.zeros((0, 4 * N_FEATURES), dtype=np.float32)
     return pair_ids, mat
 
 
@@ -421,10 +462,8 @@ def main() -> int:
                     help="directory with {pair_,}{train,val,test}.parquet")
     ap.add_argument("--out_dir", default="runs/heads/extraction",
                     help="where to write ast_{pair,point}_{split}.parquet")
-    ap.add_argument("--pairwise_only", action="store_true",
-                    help="skip pointwise (only pair features)")
-    ap.add_argument("--pointwise_only", action="store_true",
-                    help="skip pairwise (only per-snippet features)")
+    ap.add_argument("--pairwise_only", action="store_true")
+    ap.add_argument("--pointwise_only", action="store_true")
     args = ap.parse_args()
 
     in_dir = Path(args.in_splits)
@@ -453,14 +492,11 @@ def main() -> int:
             _write_pairwise(pair_ids, mat, dst)
             print(f"[ast] wrote {dst}: {mat.shape}", flush=True)
 
-    # Also write a schema file so downstream code can re-derive column order.
     (out_dir / "ast_schema.json").write_text(json.dumps({
+        "n_features": N_FEATURES,
         "feature_names": list(FEATURE_NAMES),
-        "feature_kind": FEATURE_KIND,
-        "n_features_per_snippet": N_FEATURES,
-        "pair_columns": diff_columns(),
+        "kinds": {n: k for n, k in FEATURES},
     }, indent=2), encoding="utf-8")
-    print(f"[ast] wrote {out_dir / 'ast_schema.json'}", flush=True)
     return 0
 
 

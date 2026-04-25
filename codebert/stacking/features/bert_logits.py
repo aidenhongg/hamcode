@@ -65,20 +65,14 @@ def code_sha(code: str) -> str:
 # -----------------------------------------------------------------------------
 
 def load_frozen_model(ckpt_dir: str | Path) -> tuple[LongCoderClassifier, "AutoTokenizer"]:
-    """Load a pointwise LongCoderClassifier checkpoint in eval + no-grad mode.
-
-    For LoRA checkpoints we merge the adapter into the base weights so the
-    extraction forward pays no per-step LoRA matmul cost.
-    """
+    """Load a pointwise LongCoderClassifier checkpoint in eval + no-grad mode."""
     p = Path(ckpt_dir)
-    has_full = (p / "pytorch_model.bin").exists()
-    has_adapter = (p / "adapter").exists()
-    if not (has_full or has_adapter):
+    if not (p / "pytorch_model.bin").exists():
         raise FileNotFoundError(
-            f"No checkpoint at {p}. Expected either pytorch_model.bin (full FT) "
-            f"or adapter/ + classifier.pt (LoRA), plus codebert_meta.json."
+            f"No pytorch_model.bin at {p}. Expected layout: "
+            f"<ckpt>/pytorch_model.bin + <ckpt>/codebert_meta.json"
         )
-    model = LongCoderClassifier.load_checkpoint(p, merge_lora=True)
+    model = LongCoderClassifier.load_checkpoint(p)
     model.eval()
     for pm in model.parameters():
         pm.requires_grad_(False)
@@ -95,10 +89,23 @@ def _encode_point_batch(
     tokenizer,
     max_seq_len: int,
     bridge_stride: int = 128,
+    languages: list[str] | str = "python",
 ) -> dict:
+    """Build LongCoder bundles for a batch.
+
+    `languages` is either a single language string applied to all codes, or
+    a list of per-row language strings the same length as `codes`. The right
+    tree-sitter parser is dispatched per row.
+    """
+    if isinstance(languages, str):
+        langs_list = [languages] * len(codes)
+    else:
+        if len(languages) != len(codes):
+            raise ValueError("len(languages) != len(codes)")
+        langs_list = list(languages)
     bundles = [
-        build_point_inputs(c, tokenizer, max_seq_len, bridge_stride)
-        for c in codes
+        build_point_inputs(c, tokenizer, max_seq_len, bridge_stride, language=lang)
+        for c, lang in zip(codes, langs_list)
     ]
     return {
         "input_ids": torch.from_numpy(np.stack([b.input_ids for b in bundles])),
@@ -126,12 +133,7 @@ def _autocast_dtype(device: torch.device, use_amp: bool) -> "torch.dtype | None"
 
 @torch.no_grad()
 def _forward_with_cls(model, enc, device, use_fp16: bool) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run the encoder; return (logits, pooled_vec). pooled_vec shape (B, hidden).
-
-    Always uses the full-forward path. Extraction-time LoRA checkpoints have
-    already been merge_and_unload'd in load_frozen_model so this stays branch
-    free.
-    """
+    """Run the encoder; return (logits, pooled_vec). pooled_vec shape (B, hidden)."""
     input_ids = enc["input_ids"].to(device, non_blocking=True)
     attn = enc["attention_mask"].to(device, non_blocking=True)
     g_attn = enc["global_attention_mask"].to(device, non_blocking=True)
@@ -242,7 +244,7 @@ def extract_point(
     model = model.to(dev)
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    hidden = int(model._base_longformer.config.hidden_size)
+    hidden = int(model.encoder.config.hidden_size)
     n_labels = int(model.num_labels)
 
     for sp in ("train", "val", "test"):

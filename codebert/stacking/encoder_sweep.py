@@ -99,22 +99,6 @@ def _run_recipe(
     print(f"[encoder-sweep] note: {recipe.get('note', '')}", flush=True)
     t0 = time.time()
 
-    if recipe.get("activation_cache"):
-        if recipe.get("lora_freeze_depth", 0) <= 0:
-            raise ValueError(
-                f"recipe {name}: activation_cache requires lora_freeze_depth > 0"
-            )
-        cache_cmd = [
-            sys.executable, "cache_activations.py",
-            "--data_dir", str(data_dir),
-            "--model_name", recipe.get("model_name", "microsoft/longcoder-base"),
-            "--freeze_depth", str(recipe["lora_freeze_depth"]),
-            "--max_seq_len", str(recipe["max_seq_len"]),
-            "--bridge_stride", str(recipe["bridge_stride"]),
-            "--batch_size", str(recipe.get("extract_batch", 4)),
-        ]
-        _run(cache_cmd)
-
     oof_cmd = [
         sys.executable, "-m", "stacking.features.oof_point",
         "--data_dir", str(data_dir),
@@ -133,18 +117,6 @@ def _run_recipe(
         "--resume",
     ]
     oof_cmd += _flag("bf16", recipe.get("bf16", True))
-    oof_cmd += _flag("lora", recipe.get("lora", False))
-    if recipe.get("lora"):
-        oof_cmd += [
-            "--lora_r", str(recipe.get("lora_r", 16)),
-            "--lora_alpha", str(recipe.get("lora_alpha", 32)),
-            "--lora_dropout", str(recipe.get("lora_dropout", 0.05)),
-            "--lora_target_modules", recipe.get(
-                "lora_target_modules", "query,value,query_global,value_global"
-            ),
-            "--lora_freeze_depth", str(recipe.get("lora_freeze_depth", 0)),
-        ]
-    oof_cmd += _flag("activation_cache", recipe.get("activation_cache", False))
     _run(oof_cmd)
 
     sem_cmd = [

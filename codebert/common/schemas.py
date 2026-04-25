@@ -8,10 +8,29 @@ from typing import Optional
 import pyarrow as pa
 
 
+# Canonical language identifiers used everywhere downstream.
+LANGUAGES: tuple[str, ...] = (
+    "python",
+    "java",
+    "cpp",
+    "c",
+    "csharp",
+    "go",
+    "javascript",
+    "typescript",
+    "php",
+    "ruby",
+    "rust",
+    "swift",
+)
+LANG_SET: frozenset[str] = frozenset(LANGUAGES)
+
+
 @dataclass
 class PointRecord:
     id: str
-    source: str                  # leetcode | codecomplex | codenet | synthetic
+    source: str                  # leetcode | codecomplex | kamyu | mbxp | rosetta | synthetic
+    language: str                # one of LANGUAGES
     problem_id: Optional[str]
     solution_idx: Optional[int]
     code: str
@@ -30,6 +49,7 @@ class PointRecord:
 @dataclass
 class PairRecord:
     pair_id: str
+    language: str                # within-language pairs only; both sides share this language
     code_a: str
     code_b: str
     label_a: str
@@ -50,6 +70,7 @@ class PairRecord:
 POINT_SCHEMA = pa.schema([
     ("id", pa.string()),
     ("source", pa.string()),
+    ("language", pa.string()),
     ("problem_id", pa.string()),
     ("solution_idx", pa.int32()),
     ("code", pa.string()),
@@ -64,6 +85,7 @@ POINT_SCHEMA = pa.schema([
 
 PAIR_SCHEMA = pa.schema([
     ("pair_id", pa.string()),
+    ("language", pa.string()),
     ("code_a", pa.string()),
     ("code_b", pa.string()),
     ("label_a", pa.string()),
@@ -79,6 +101,7 @@ PAIR_SCHEMA = pa.schema([
 @dataclass
 class RawRecord:
     source: str
+    language: str
     problem_id: Optional[str]
     solution_idx: Optional[int]
     code: str

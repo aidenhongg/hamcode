@@ -1,10 +1,9 @@
 # Encoder-recipe sweep driven by stacking/encoder_sweep.py.
 #
 # Each recipe runs:
-#   1. (optional) cache_activations.py  — populate the frozen-prefix activation cache
-#   2. oof_point.py                     — 5 OOF folds + 1 full-train pointwise
-#   3. semantic.py                      — pair similarity from pooled vectors
-#   4. stacking.sweep                   — head grid (xgb / lgbm / mlp / stacked × seeds)
+#   1. oof_point.py     - 5 OOF folds + 1 full-train pointwise
+#   2. semantic.py      - pair similarity from pooled vectors
+#   3. stacking.sweep   - head grid (xgb / lgbm / mlp / stacked x seeds)
 #
 # After all recipes finish, encoder_sweep.py writes
 # runs/heads/ENCODER_SUMMARY.md with the best test macro-F1 per recipe and
@@ -12,41 +11,23 @@
 
 defaults: &defaults
   epochs: 40
-  batch_size: 16            # LoRA + frozen prefix → small live VRAM, GPU underutilized at bs=4
-  grad_accum: 2             # effective batch 32, same as bs=4 + ga=8
+  # Tuned for a 24 GB GPU (4090 / A10 / A5000) at seq 1024, full FT, bf16.
+  # Live VRAM ~ 12-14 GB. On a 32 GB 5090 you can bump batch_size to 16 / ga 2.
+  batch_size: 8
+  grad_accum: 4             # effective batch 32
   num_workers: 4
-  max_seq_len: 4096
-  bridge_stride: 128
+  max_seq_len: 1024
+  bridge_stride: 128        # 8 bridge tokens uniformly across the sequence
   eval_every_steps: 100
   patience: 3
   bf16: true
   extract_batch: 8
-  lr: 1.0e-4               # LoRA-recommended; full-FT (if added) should override to 2e-5
+  lr: 2.0e-5
 
 recipes:
-  # Experiment A — LoRA on Q+V (regular + global) of all 12 layers.
-  - name: lora-r16-all
+  - name: full-ft-1024
     <<: *defaults
-    lora: true
-    lora_r: 16
-    lora_alpha: 32
-    lora_dropout: 0.05
-    lora_target_modules: query,value,query_global,value_global
-    lora_freeze_depth: 0
-    activation_cache: false
-    note: "LoRA on Q+V + global-Q+V across all 12 layers (~1.2M trainable)."
-
-  # Experiment B — LoRA on top 6, bottom 6 fully frozen, frozen-prefix activations cached.
-  - name: lora-r16-top6-cached
-    <<: *defaults
-    lora: true
-    lora_r: 16
-    lora_alpha: 32
-    lora_dropout: 0.05
-    lora_target_modules: query,value,query_global,value_global
-    lora_freeze_depth: 6
-    activation_cache: true
-    note: "LoRA on Q+V + global-Q+V of top 6 layers; bottom 6 cached on disk."
+    note: "Full finetune, all 150M params trainable, seq 1024, bf16."
 
 # Head sweep used after each recipe's OOF; same as stacking/configs/sweep.yaml.
 head_sweep:

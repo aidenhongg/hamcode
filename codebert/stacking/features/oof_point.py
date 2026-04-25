@@ -81,11 +81,7 @@ from stacking.features.bert_logits import (
 # -----------------------------------------------------------------------------
 
 def _checkpoint_exists(best_dir: Path) -> bool:
-    """A best/ checkpoint may be either full-FT (pytorch_model.bin) or LoRA
-    (adapter/ + classifier.pt). Either layout is valid for resume."""
-    has_full = (best_dir / "pytorch_model.bin").exists()
-    has_adapter = (best_dir / "adapter").exists() and (best_dir / "classifier.pt").exists()
-    return has_full or has_adapter
+    return (best_dir / "pytorch_model.bin").exists()
 
 
 def _fold_key(row: dict) -> str:
@@ -167,14 +163,6 @@ def train_one_fold(
     eval_every_steps: int,
     patience: int,
     seed: int,
-    lora: bool = False,
-    lora_r: int = 16,
-    lora_alpha: int = 32,
-    lora_dropout: float = 0.05,
-    lora_target_modules: str = "query,value,query_global,value_global",
-    lora_freeze_depth: int = 0,
-    activation_cache: bool = False,
-    activation_cache_dir: str | None = None,
 ) -> None:
     """Invoke train.py as a subprocess with fold-specific parquet paths."""
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -199,30 +187,14 @@ def train_one_fold(
         cmd.append("--bf16")
     else:
         cmd.append("--no_bf16")
-    if lora:
-        cmd += [
-            "--lora",
-            "--lora_r", str(lora_r),
-            "--lora_alpha", str(lora_alpha),
-            "--lora_dropout", f"{lora_dropout}",
-            "--lora_target_modules", lora_target_modules,
-            "--lora_freeze_depth", str(lora_freeze_depth),
-        ]
-    if activation_cache:
-        cmd.append("--activation_cache")
-        if activation_cache_dir:
-            cmd += ["--activation_cache_dir", activation_cache_dir]
 
     print(f"[oof] fold {fold_idx}: {' '.join(cmd)}", flush=True)
     proc = subprocess.run(cmd, check=False)
     if proc.returncode != 0:
         raise RuntimeError(f"fold {fold_idx} training failed (exit={proc.returncode}); "
                            f"see {run_dir / 'train.log'}")
-    # Verify best/ exists with either the full-FT or LoRA layout
     best_dir = run_dir / "best"
-    has_full = (best_dir / "pytorch_model.bin").exists()
-    has_adapter = (best_dir / "adapter").exists() and (best_dir / "classifier.pt").exists()
-    if not (has_full or has_adapter):
+    if not (best_dir / "pytorch_model.bin").exists():
         raise RuntimeError(f"fold {fold_idx}: no best/ checkpoint produced at {best_dir}")
 
 
@@ -249,7 +221,7 @@ def extract_logits_and_cls(
     for pm in model.parameters():
         pm.requires_grad_(False)
     n_labels = int(model.num_labels)
-    hidden = int(model._base_longformer.config.hidden_size)
+    hidden = int(model.encoder.config.hidden_size)
 
     logit_writer = _IncrementalParquetWriter(out_dir, f"point_logits_{split_name}", "id")
     cls_writer = _IncrementalParquetWriter(out_dir, f"point_cls_{split_name}", "id")
@@ -302,7 +274,7 @@ def extract_from_checkpoint(
     device_str: str,
 ) -> None:
     device = torch.device(device_str)
-    model = LongCoderClassifier.load_checkpoint(ckpt_dir, merge_lora=True)
+    model = LongCoderClassifier.load_checkpoint(ckpt_dir)
     model = model.to(device)
     tokenizer = AutoTokenizer.from_pretrained(model.model_name)
     extract_logits_and_cls(
@@ -363,15 +335,6 @@ def main() -> int:
     ap.add_argument("--skip_final", action="store_true",
                     help="Skip the final full-train model + val/test extraction.")
 
-    # LoRA finetuning flags (forwarded to train.py)
-    ap.add_argument("--lora", action="store_true", default=False)
-    ap.add_argument("--lora_r", type=int, default=16)
-    ap.add_argument("--lora_alpha", type=int, default=32)
-    ap.add_argument("--lora_dropout", type=float, default=0.05)
-    ap.add_argument("--lora_target_modules", default="query,value,query_global,value_global")
-    ap.add_argument("--lora_freeze_depth", type=int, default=0)
-    ap.add_argument("--activation_cache", action="store_true", default=False)
-    ap.add_argument("--activation_cache_dir", default=None)
     args = ap.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -422,12 +385,6 @@ def main() -> int:
                 bridge_stride=args.bridge_stride,
                 eval_every_steps=args.eval_every_steps, patience=args.patience,
                 seed=args.seed + fold_idx,
-                lora=args.lora, lora_r=args.lora_r, lora_alpha=args.lora_alpha,
-                lora_dropout=args.lora_dropout,
-                lora_target_modules=args.lora_target_modules,
-                lora_freeze_depth=args.lora_freeze_depth,
-                activation_cache=args.activation_cache,
-                activation_cache_dir=args.activation_cache_dir,
             )
 
         # Inference on held-out fold using this fold's best checkpoint.
@@ -436,14 +393,14 @@ def main() -> int:
         held_codes = held_tbl.column("code").to_pylist()
         # Reuse the same writers so all folds land in one merged parquet.
         device = torch.device(args.device)
-        model = LongCoderClassifier.load_checkpoint(best_dir, merge_lora=True)
+        model = LongCoderClassifier.load_checkpoint(best_dir)
         model = model.to(device)
         tokenizer = AutoTokenizer.from_pretrained(model.model_name)
         model.eval()
         for pm in model.parameters():
             pm.requires_grad_(False)
         n_labels = int(model.num_labels)
-        hidden = int(model._base_longformer.config.hidden_size)
+        hidden = int(model.encoder.config.hidden_size)
 
         # Manual loop so we can write into the shared per-split writers.
         todo = [(id_, c) for id_, c in zip(held_ids, held_codes)
@@ -505,12 +462,6 @@ def main() -> int:
                 bridge_stride=args.bridge_stride,
                 eval_every_steps=args.eval_every_steps, patience=args.patience,
                 seed=args.seed,
-                lora=args.lora, lora_r=args.lora_r, lora_alpha=args.lora_alpha,
-                lora_dropout=args.lora_dropout,
-                lora_target_modules=args.lora_target_modules,
-                lora_freeze_depth=args.lora_freeze_depth,
-                activation_cache=args.activation_cache,
-                activation_cache_dir=args.activation_cache_dir,
             )
 
         for split, pq_path in (("val", val_pq), ("test", test_pq)):

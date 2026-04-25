@@ -1,9 +1,10 @@
-"""Dedupe + filter.
+"""Dedupe + filter (multi-language).
 
-1) MinHash LSH across *all* sources to drop near-duplicate code (threshold 0.85).
-2) ast.parse() sanity check.
-3) Token-length gate via LongCoder tokenizer if available,
-   else a char-length heuristic (~4.2 chars/token for Python).
+1) Per-language tree-sitter syntax check (replaces ast.parse() — supports all 11 + Python).
+2) Token-length gate via the LongCoder tokenizer (mandatory; the char heuristic
+   was Python-tuned and underestimates token count by ~2x for the new languages).
+3) MinHash LSH across *all* sources to drop near-duplicate code (threshold 0.85).
+   Dedup buckets per language so a Python sort and a Rust sort don't collide.
 
 Output:
     data/interim/filtered.jsonl
@@ -12,15 +13,12 @@ Output:
 from __future__ import annotations
 
 import argparse
-import ast
 import hashlib
 import json
 import sys
 import warnings
 from pathlib import Path
 
-# Silence Py3.12's noisy "invalid escape sequence" SyntaxWarnings emitted by
-# ast.parse() on LeetCode solutions that embed regex patterns in strings.
 warnings.filterwarnings("ignore", category=SyntaxWarning)
 
 _THIS = Path(__file__).resolve()
@@ -28,7 +26,8 @@ sys.path.insert(0, str(_THIS.parent.parent))
 
 from datasketch import MinHash, MinHashLSH  # type: ignore
 
-_CHAR_PER_TOKEN = 4.2  # Python-ish average for RoBERTa BPE
+from common.parsers import parse, syntax_ok, walk
+from common.schemas import LANG_SET
 
 
 def _shingles(code: str, k: int = 5) -> set[str]:
@@ -45,23 +44,24 @@ def _minhash(tokens: set[str], num_perm: int = 64) -> MinHash:
 
 
 def _load_bpe_tokenizer():
-    try:
-        from transformers import AutoTokenizer  # type: ignore
-        import transformers.utils.logging as hf_logging  # type: ignore
-        hf_logging.set_verbosity_error()   # silence per-sample "too long" spam
-        tok = AutoTokenizer.from_pretrained("microsoft/longcoder-base")
-        # Bump effective max so the tokenizer doesn't warn on samples we'll drop anyway.
-        tok.model_max_length = 1_000_000
-        return tok
-    except Exception as e:
-        print(f"[06] tokenizer unavailable ({e}); falling back to char heuristic", flush=True)
-        return None
+    from transformers import AutoTokenizer  # type: ignore
+    import transformers.utils.logging as hf_logging  # type: ignore
+    hf_logging.set_verbosity_error()
+    tok = AutoTokenizer.from_pretrained("microsoft/longcoder-base")
+    tok.model_max_length = 1_000_000
+    return tok
 
 
 def token_len(code: str, tokenizer) -> int:
-    if tokenizer is None:
-        return int(len(code) / _CHAR_PER_TOKEN)
     return len(tokenizer.encode(code, add_special_tokens=False))
+
+
+def _node_count(language: str, code: str) -> int:
+    try:
+        tree = parse(language, code)
+    except Exception:
+        return 0
+    return sum(1 for _ in walk(tree.root_node))
 
 
 def main() -> int:
@@ -73,33 +73,36 @@ def main() -> int:
                          "CLS, SEP, bridge, and memory tokens).")
     ap.add_argument("--min_tokens", type=int, default=6)
     ap.add_argument("--threshold", type=float, default=0.85)
-    ap.add_argument("--skip_tokenizer", action="store_true",
-                    help="skip HF tokenizer; use char-length heuristic")
     args = ap.parse_args()
 
     in_path = Path(args.in_path)
     out = Path(args.out); out.parent.mkdir(parents=True, exist_ok=True)
     if not in_path.exists():
-        print(f"[06] {in_path} missing — did 05 run?", file=sys.stderr)
+        print(f"[06] {in_path} missing - did 05 run?", file=sys.stderr)
         return 1
 
-    tokenizer = None if args.skip_tokenizer else _load_bpe_tokenizer()
-    lsh = MinHashLSH(threshold=args.threshold, num_perm=64)
+    tokenizer = _load_bpe_tokenizer()
 
-    n_in = n_kept = n_ast_fail = n_dup = n_too_long = n_too_short = 0
+    # One LSH instance per language so cross-language coincidences don't dedup.
+    per_lang_lsh: dict[str, MinHashLSH] = {}
+
+    n_in = n_kept = n_no_lang = n_syntax_fail = n_dup = n_too_long = n_too_short = 0
+    per_lang_kept: dict[str, int] = {}
     with in_path.open("r", encoding="utf-8") as fin, out.open("w", encoding="utf-8") as fout:
         for line in fin:
             n_in += 1
             rec = json.loads(line)
             code = rec.get("code", "")
-
-            # 1) ast.parse
-            try:
-                tree = ast.parse(code)
-            except SyntaxError:
-                n_ast_fail += 1
+            language = rec.get("language") or "python"
+            if language not in LANG_SET:
+                n_no_lang += 1
                 continue
-            rec["ast_nodes"] = sum(1 for _ in ast.walk(tree))
+
+            # 1) syntax check
+            if not syntax_ok(language, code):
+                n_syntax_fail += 1
+                continue
+            rec["ast_nodes"] = _node_count(language, code)
 
             # 2) token length
             tl = token_len(code, tokenizer)
@@ -111,12 +114,16 @@ def main() -> int:
                 n_too_short += 1
                 continue
 
-            # 3) near-dup via MinHash
+            # 3) per-language near-dup via MinHash
             shingles = _shingles(code)
             if not shingles:
                 n_too_short += 1
                 continue
             m = _minhash(shingles)
+            lsh = per_lang_lsh.get(language)
+            if lsh is None:
+                lsh = MinHashLSH(threshold=args.threshold, num_perm=64)
+                per_lang_lsh[language] = lsh
             matches = lsh.query(m)
             if matches:
                 n_dup += 1
@@ -124,12 +131,16 @@ def main() -> int:
             key = hashlib.sha256(code.encode("utf-8")).hexdigest()[:16]
             lsh.insert(key, m)
 
+            rec["language"] = language
             rec["code_sha256"] = hashlib.sha256(code.encode("utf-8")).hexdigest()
             fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
             n_kept += 1
+            per_lang_kept[language] = per_lang_kept.get(language, 0) + 1
 
-    print(f"[06] in={n_in} kept={n_kept} ast_fail={n_ast_fail} dup={n_dup} "
-          f"long={n_too_long} short={n_too_short}", flush=True)
+    print(f"[06] in={n_in} kept={n_kept} syntax_fail={n_syntax_fail} dup={n_dup} "
+          f"long={n_too_long} short={n_too_short} no_lang={n_no_lang}", flush=True)
+    for lang in sorted(per_lang_kept):
+        print(f"[06]   {lang:<12s} kept={per_lang_kept[lang]}", flush=True)
     return 0
 
 

@@ -1,7 +1,14 @@
-"""Split balanced data into train/val/test by problem_id, stratified by label.
+"""Split balanced data into train/val/test by problem_id, stratified by (language, label).
 
-Each problem_id goes entirely into one split (no leakage). Records without a
-problem_id default to the train split.
+Each problem_id (across ALL languages — same LeetCode 0001 in Python and Java
+shares one problem_id) goes entirely into one split (no leakage). Records
+without a problem_id get a synthetic per-record id so they don't collide with
+each other and default to `train` allocation rules.
+
+The stratification key for split assignment is (language, label_for_pid):
+  - For each problem_id, derive a "primary" label from the first record we see.
+  - Bucket pids by (language, primary_label); shuffle within each bucket;
+    assign 80/10/10.
 """
 
 from __future__ import annotations
@@ -9,7 +16,6 @@ from __future__ import annotations
 import argparse
 import json
 import random
-import sys
 from collections import defaultdict
 from pathlib import Path
 
@@ -30,20 +36,32 @@ def main() -> int:
         for line in f:
             records.append(json.loads(line))
 
-    # Derive a stable "problem label" for each pid (first label seen).
-    pid_label: dict[str, str] = {}
-    for r in records:
-        pid = r.get("problem_id")
-        if pid and pid not in pid_label:
-            pid_label[pid] = r["label"]
+    # Synthesize a unique pid for records lacking one (avoids "all None pid -> all-train").
+    for i, r in enumerate(records):
+        if not r.get("problem_id"):
+            r["problem_id"] = f"_anon-{r.get('code_sha256', i)[:12]}-{i}"
 
-    # Bucket pids by label, shuffle, assign splits.
-    pid_buckets: dict[str, list[str]] = defaultdict(list)
-    for pid, lab in pid_label.items():
-        pid_buckets[lab].append(pid)
+    # First (language, label) per pid — pids are language-tagged because in our
+    # ingest each (lang) fence in one block becomes its own per-language record;
+    # however the SAME LeetCode number 0001 is the SAME problem_id across
+    # languages, and we want it to land in the same split for ALL languages to
+    # prevent cross-language leakage. So we key the split assignment by pid
+    # alone and stratify by *one* representative (language, label).
+    pid_label: dict[str, tuple[str, str]] = {}
+    pid_records: dict[str, list[dict]] = defaultdict(list)
+    for r in records:
+        pid = r["problem_id"]
+        pid_records[pid].append(r)
+        if pid not in pid_label:
+            pid_label[pid] = (r.get("language", "python"), r["label"])
+
+    # Bucket pids by (language, label); stratify-assign within each bucket.
+    pid_buckets: dict[tuple[str, str], list[str]] = defaultdict(list)
+    for pid, key in pid_label.items():
+        pid_buckets[key].append(pid)
 
     assignment: dict[str, str] = {}
-    for lab, pids in pid_buckets.items():
+    for key, pids in pid_buckets.items():
         rng.shuffle(pids)
         n = len(pids)
         n_tr = int(n * args.train)
@@ -56,22 +74,26 @@ def main() -> int:
             else:
                 assignment[pid] = "test"
 
+    # Apply assignment to every record (every record sharing pid pins to same split)
     n_split: dict[str, int] = defaultdict(int)
-    per_split_class: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    per_split_lang_class: dict[str, dict[tuple[str, str], int]] = defaultdict(lambda: defaultdict(int))
     with open(args.out, "w", encoding="utf-8") as fout:
         for r in records:
-            pid = r.get("problem_id")
-            split = assignment.get(pid, "train") if pid else "train"
+            split = assignment.get(r["problem_id"], "train")
             r["split"] = split
             n_split[split] += 1
-            per_split_class[split][r["label"]] += 1
+            per_split_lang_class[split][(r.get("language", "python"), r["label"])] += 1
             fout.write(json.dumps(r, ensure_ascii=False) + "\n")
 
     print(f"[08] split counts: {dict(n_split)}", flush=True)
     for sp in ("train", "val", "test"):
-        print(f"[08]   {sp}: {dict(per_split_class[sp])}", flush=True)
+        per_lang = defaultdict(int)
+        for (lang, _lab), n in per_split_lang_class[sp].items():
+            per_lang[lang] += n
+        per_lang_str = " ".join(f"{lang}={n}" for lang, n in sorted(per_lang.items()))
+        print(f"[08]   {sp:<5s} per-lang totals: {per_lang_str}", flush=True)
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

@@ -1,0 +1,30 @@
+# Per-language LoRA fine-tune on top of the Phase-A universal backbone.
+
+# LoRA config
+r: 16
+lora_alpha: 32
+lora_dropout: 0.1
+target_modules: [query, key, value, query_global, key_global, value_global]
+
+# Training
+max_seq_len: 1024
+bridge_stride: 128
+batch_size: 16            # LoRA fits more per batch than full FT
+grad_accum: 2
+lr: 2.0e-4                # 10x full-FT lr is standard LoRA practice
+warmup_ratio: 0.10
+weight_decay: 0.0
+epochs: 20
+patience: 4
+min_delta: 1.0e-4
+label_smoothing: 0.05
+bf16: true
+class_weights: auto
+balanced_sampler: true    # within-(label) inside the language slice
+seed: 42
+
+# Eval cadence
+eval_every_steps: 200
+
+# Logging
+wandb_project: codebert-complexity-lora

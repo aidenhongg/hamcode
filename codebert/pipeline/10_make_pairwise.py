@@ -51,23 +51,24 @@ def main() -> int:
     table = pq.read_table(args.in_path)
     df = table.to_pylist()
 
-    by_split: dict[str, list[dict]] = defaultdict(list)
+    # Bucket by (language, split). Pairs are within-language only — cross-language
+    # comparisons would require the encoder to reason across syntactic dialects
+    # for every pair and add noise without a clear payoff.
+    by_split_lang: dict[tuple[str, str], list[dict]] = defaultdict(list)
     for r in df:
-        by_split[r["split"]].append(r)
+        by_split_lang[(r["split"], r.get("language", "python"))].append(r)
 
     all_rows: list[dict] = []
     pair_idx = 0
 
-    # target per-cell scales by split fraction
     split_fractions = {"train": 0.80, "val": 0.10, "test": 0.10}
+    cells = [(la, lb) for i, la in enumerate(POINT_LABELS) for lb in POINT_LABELS[i:]]
 
-    for sp, rows in by_split.items():
+    for (sp, lang), rows in by_split_lang.items():
         share = split_fractions.get(sp, 0.80)
-        split_target = int(args.target_total * share)
-        cells = [(la, lb) for i, la in enumerate(POINT_LABELS) for lb in POINT_LABELS[i:]]
+        split_target = int(args.target_total * share / max(1, len(set(l for _, l in by_split_lang))))
         per_cell = max(1, split_target // max(1, len(cells)))
 
-        # same-problem pairs (canonicalized: tier_A <= tier_B always)
         by_pid: dict[str, list[dict]] = defaultdict(list)
         for r in rows:
             if r["problem_id"]:
@@ -78,7 +79,6 @@ def main() -> int:
                 a, b = _canonicalize(a, b)
                 sp_pairs.append((a, b, True))
 
-        # cross-problem pairs, uniform per (class_a, class_b) cell
         by_label: dict[str, list[dict]] = defaultdict(list)
         for r in rows:
             by_label[r["label"]].append(r)
@@ -109,19 +109,20 @@ def main() -> int:
 
         for a, b, same_prob in sp_pairs + cross_pairs:
             label = pair_label_from_labels(a["label"], b["label"])
-            # Canonicalization guarantees label is never "B_faster" — assert it
-            # so any future caller that bypasses _canonicalize fails loudly.
             assert label in ("same", "A_faster"), (
                 f"non-canonical pair survived filter: {a['label']!r} vs {b['label']!r}"
             )
+            assert a.get("language") == b.get("language") == lang, (
+                f"cross-language pair leaked: {a.get('language')!r} vs {b.get('language')!r}"
+            )
             all_rows.append({
                 "pair_id": f"p{pair_idx:07d}",
+                "language": lang,
                 "code_a": a["code"],
                 "code_b": b["code"],
                 "label_a": a["label"],
                 "label_b": b["label"],
-                "ternary": label,        # column kept named 'ternary' for schema
-                                         # compatibility; values are binary now.
+                "ternary": label,
                 "same_problem": same_prob,
                 "tokens_combined": int(a.get("tokens_bpe") or 0)
                                    + int(b.get("tokens_bpe") or 0),
