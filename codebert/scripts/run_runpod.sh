@@ -40,11 +40,11 @@ LANGUAGES=${LANGUAGES:-"python java cpp c csharp go javascript typescript php ru
 #                      min total). Stacker train metrics will be inflated.
 #   oof              — oof_lora.py: K-fold per language. Trains K LoRAs per
 #                      language to produce out-of-fold train logits with no
-#                      train-set leakage. Expensive (~30 h on 4090 at K=5,
-#                      ~18 h at K=3). Recommended only when binary-head
+#                      train-set leakage. K=3 (default) ~= 18 h on a 4090;
+#                      K=5 ~= 30 h. Recommended only when binary-head
 #                      generalization is the deliverable.
 EXTRACT_MODE=${EXTRACT_MODE:-leaky}
-OOF_FOLDS=${OOF_FOLDS:-5}
+OOF_FOLDS=${OOF_FOLDS:-3}
 
 TS=$(date +%Y%m%d-%H%M%S)
 FULLFT_DIR=${FULLFT_DIR:-${RUN_ROOT}/multi-fullft-${TS}}

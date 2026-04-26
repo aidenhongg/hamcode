@@ -34,8 +34,9 @@ Output layout (matches stacking/features/extract_lora_features.py):
         heldout.parquet                            (the fold's left-out rows)
 
 Cost on a 4090: ~30 min per LoRA fold * K folds * up-to-12 languages.
-At K=5 / 12 langs: ~30 hours. Use --n_folds 3 for ~18h, or --languages
-to restrict to a subset.
+At K=3 / 12 langs: ~18 hours (default). K=5 ~= 30 hours; use --n_folds 5
+if you want tighter OOF estimates and have the budget. --languages can
+restrict to a subset for faster iteration.
 
 CLI:
     python -m stacking.features.oof_lora \\
@@ -43,7 +44,7 @@ CLI:
         --full_lora_root runs/lora-{ts}/ \\
         --in_splits data/processed \\
         --out_dir runs/heads/extraction \\
-        --n_folds 5
+        --n_folds 3
 """
 
 from __future__ import annotations
@@ -295,7 +296,9 @@ def main() -> int:
                     help="Dir with train/val/test.parquet from pipeline/09")
     ap.add_argument("--out_dir", default="runs/heads/extraction",
                     help="Destination for point_{logits,cls}_{split}.parquet")
-    ap.add_argument("--n_folds", type=int, default=5)
+    ap.add_argument("--n_folds", type=int, default=3,
+                    help="K for K-fold OOF (default 3 for ~18h on 4090; "
+                         "use 5 for tighter estimates at ~30h)")
     ap.add_argument("--seed", type=int, default=42)
 
     # Per-fold lora_train.py hyperparams
