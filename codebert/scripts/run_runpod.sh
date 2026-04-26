@@ -364,18 +364,29 @@ if stage_at_or_after extract; then
 fi
 
 # ---------------------------------------------------------------- Phase 6: head
+# Which binary head types to train. `stacked` is self-contained (trains
+# xgb+lgbm+mlp internally + a logreg meta), but training the standalone heads
+# alongside it gives a useful comparison baseline. All five are CPU-bound and
+# fast (~5-30 min each on a 4090 host).
+HEAD_TYPES=${HEAD_TYPES:-"lgbm xgb mlp logreg stacked"}
+
 if stage_at_or_after head; then
     echo
-    echo "=== [6] Phase D: train binary head ==="
+    echo "=== [6] Phase D: train binary head(s) [${HEAD_TYPES}] ==="
     require_file "${HEAD_EXTRACTION}/point_logits_train.parquet" "Phase C extraction output" \
         "STAGE=extract first"
     require_file "${DATA_DIR}/processed/pair_train.parquet" "pairwise parquet" \
         "drop the STAGE flag to run fetch+parse, or STAGE=parse"
-    python -m stacking.train_head \
-        --in_dir "${HEAD_EXTRACTION}" \
-        --pair_dir "${DATA_DIR}/processed" \
-        --out_dir "${HEAD_RUN}" \
-        --variant v1
+    mkdir -p "${HEAD_RUN}"
+    for head in ${HEAD_TYPES}; do
+        echo "[runpod]   --- head=${head} ---"
+        python -m stacking.train_head \
+            --head "${head}" \
+            --in_splits "${DATA_DIR}/processed" \
+            --extraction_dir "${HEAD_EXTRACTION}" \
+            --out_dir "${HEAD_RUN}/${head}"
+    done
+    echo "[runpod] heads trained under: ${HEAD_RUN}/{${HEAD_TYPES// /,}}"
 fi
 
 echo
