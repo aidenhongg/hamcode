@@ -10,11 +10,16 @@ Usage:
 Writes to out_dir:
     config.json           -- resolved config
     metrics.jsonl         -- per-eval or per-epoch metrics (as applicable)
-    test_metrics.json     -- final test metrics + confusion matrix
-    predictions.parquet   -- per-pair predictions (for error analysis)
+    test_metrics.json     -- final test metrics + confusion matrix +
+                              per_language breakdown
+    predictions.parquet   -- per-pair predictions (incl. language) for
+                              error analysis
     feature_importance.json (tree heads only)
     confusion_matrix.png  -- saved if matplotlib available
     scaler.joblib + schema.json + head artifacts
+
+Per-language test perf is also printed at the end of the run, sorted by
+support (largest language first).
 """
 
 from __future__ import annotations
@@ -132,6 +137,10 @@ def run(
 
     test_met = M.compute_all(test.y, test_pred, test_prob)
     test_met["split"] = "test"
+    if test.languages:
+        test_met["per_language"] = M.compute_per_language(
+            test.y, test_pred, test_prob, test.languages,
+        )
 
     # Config + metrics
     config = {
@@ -159,13 +168,16 @@ def run(
     )
 
     # Predictions parquet
-    pred_table = pa.table({
+    pred_cols: dict[str, Any] = {
         "pair_id": test.pair_ids,
         "label_true": test.y.astype(np.int64),
         "label_pred": test_pred.astype(np.int64),
         "prob_same": 1.0 - test_prob.astype(np.float32),
         "prob_A_faster": test_prob.astype(np.float32),
-    })
+    }
+    if test.languages:
+        pred_cols["language"] = list(test.languages)
+    pred_table = pa.table(pred_cols)
     pq.write_table(pred_table, out_dir / "predictions.parquet", compression="zstd")
 
     # Feature importance
@@ -202,7 +214,27 @@ def run(
           f"macro_f1={test_met['macro_f1']:.4f} "
           f"roc_auc={test_met['roc_auc']:.4f}", flush=True)
 
+    per_lang = test_met.get("per_language")
+    if per_lang:
+        _print_per_language_table(per_lang)
+
     return test_met
+
+
+def _print_per_language_table(per_lang: dict[str, dict]) -> None:
+    rows = sorted(
+        per_lang.items(),
+        key=lambda kv: (-kv[1].get("n", 0), kv[0]),
+    )
+    print("[train_head] per-language test perf:", flush=True)
+    print(f"  {'language':<12} {'n':>6} {'acc':>7} {'macro_f1':>9} "
+          f"{'roc_auc':>8} {'pr_auc':>7}", flush=True)
+    for lang, m in rows:
+        def _fmt(x: float) -> str:
+            return "  nan  " if x != x else f"{x:.4f}"
+        print(f"  {lang:<12} {m['n']:>6d} {_fmt(m['accuracy']):>7} "
+              f"{_fmt(m['macro_f1']):>9} {_fmt(m['roc_auc']):>8} "
+              f"{_fmt(m['pr_auc']):>7}", flush=True)
 
 
 def _jsonable(obj: Any) -> Any:

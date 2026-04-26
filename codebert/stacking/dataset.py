@@ -87,6 +87,7 @@ class FeatureMatrix:
     columns: list[str]          # names, length D
     scaled_mask: np.ndarray     # (D,) bool — True for columns that went through scaler
     variant: str
+    languages: list[str] = field(default_factory=list)  # (N,) per-row language
 
     def num_features(self) -> int:
         return self.X.shape[1]
@@ -210,6 +211,10 @@ def build_feature_matrix(
     pair_tbl = pq.read_table(pair_pq)
     pair_tbl = filter_b_ge_a(pair_tbl)
     pair_ids = pair_tbl.column("pair_id").to_pylist()
+    if "language" in pair_tbl.schema.names:
+        languages = pair_tbl.column("language").to_pylist()
+    else:
+        languages = ["unknown"] * len(pair_ids)
     y = binary_labels(pair_tbl)
     log_imbalance(y, split)
 
@@ -289,6 +294,7 @@ def build_feature_matrix(
     return FeatureMatrix(
         pair_ids=pair_ids, X=X.astype(np.float32), y=y,
         columns=col_names, scaled_mask=scaled_mask, variant=variant,
+        languages=languages,
     )
 
 
@@ -308,6 +314,7 @@ def apply_scaler(fm: FeatureMatrix, scaler: StandardScaler) -> FeatureMatrix:
     return FeatureMatrix(
         pair_ids=fm.pair_ids, X=X2, y=fm.y,
         columns=fm.columns, scaled_mask=fm.scaled_mask, variant=fm.variant,
+        languages=fm.languages,
     )
 
 

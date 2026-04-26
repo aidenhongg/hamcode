@@ -13,6 +13,7 @@
 #   4. Phase A: full FT LongCoder
 #   5. Phase B: per-language LoRA (11 runs)
 #   6. Phase C: AST features + LoRA pointwise feature extraction
+#               + pair-level CLS similarity from pooled vectors
 #   7. Phase D: binary stacking head training
 #
 # Usage:
@@ -361,6 +362,20 @@ if stage_at_or_after extract; then
             exit 2
             ;;
     esac
+
+    echo "=== [5c] pair similarity from pooled CLS vectors ==="
+    # Joins pair rows against point_cls_{split}.parquet (written by Phase 5b)
+    # and emits pair_sim_{split}.parquet with cls_cosine, cls_l2,
+    # cls_mean_abs_diff, cls_max_abs_diff per pair. Pure CPU (~1s/split).
+    require_file "${HEAD_EXTRACTION}/point_cls_train.parquet" "Phase 5b CLS vectors" \
+        "STAGE=extract should have written point_cls_*.parquet"
+    require_file "${HEAD_EXTRACTION}/point_cls_val.parquet" "Phase 5b CLS vectors" \
+        "STAGE=extract should have written point_cls_*.parquet"
+    require_file "${HEAD_EXTRACTION}/point_cls_test.parquet" "Phase 5b CLS vectors" \
+        "STAGE=extract should have written point_cls_*.parquet"
+    python -m stacking.features.semantic \
+        --in_splits "${DATA_DIR}/processed" \
+        --extraction_dir "${HEAD_EXTRACTION}"
 fi
 
 # ---------------------------------------------------------------- Phase 6: head
@@ -375,6 +390,8 @@ if stage_at_or_after head; then
     echo "=== [6] Phase D: train binary head(s) [${HEAD_TYPES}] ==="
     require_file "${HEAD_EXTRACTION}/point_logits_train.parquet" "Phase C extraction output" \
         "STAGE=extract first"
+    require_file "${HEAD_EXTRACTION}/pair_sim_train.parquet" "Phase 5c pair sim output" \
+        "STAGE=extract first (5c runs after 5b)"
     require_file "${DATA_DIR}/processed/pair_train.parquet" "pairwise parquet" \
         "drop the STAGE flag to run fetch+parse, or STAGE=parse"
     mkdir -p "${HEAD_RUN}"

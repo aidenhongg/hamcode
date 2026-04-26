@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from typing import Sequence
 
 import numpy as np
@@ -83,4 +84,35 @@ def compute_all(
         "ece": ece,
     }
 
+    return out
+
+
+def compute_per_language(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    probs_pos: np.ndarray,
+    languages: Sequence[str],
+) -> dict[str, dict]:
+    """Per-language slice of compute_all. Returns {lang: metrics_dict}.
+
+    A row's language whose value is None / empty is bucketed as "unknown".
+    Metrics that need both classes (roc_auc, pr_auc, brier) become NaN when
+    a language slice has only one class.
+    """
+    if len(languages) != len(y_true):
+        raise ValueError(
+            f"len(languages)={len(languages)} != len(y_true)={len(y_true)}"
+        )
+    by_lang: dict[str, list[int]] = defaultdict(list)
+    for i, lang in enumerate(languages):
+        key = lang if lang else "unknown"
+        by_lang[key].append(i)
+
+    out: dict[str, dict] = {}
+    for lang, idx in sorted(by_lang.items()):
+        idx_arr = np.asarray(idx, dtype=np.int64)
+        out[lang] = compute_all(
+            y_true[idx_arr], y_pred[idx_arr], probs_pos[idx_arr],
+        )
+        out[lang]["n"] = int(len(idx_arr))
     return out
