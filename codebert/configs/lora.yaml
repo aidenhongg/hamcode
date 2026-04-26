@@ -9,8 +9,13 @@ target_modules: [query, key, value, query_global, key_global, value_global]
 # Training
 max_seq_len: 1024
 bridge_stride: 128
-batch_size: 16            # LoRA fits more per batch than full FT
-grad_accum: 2
+# IMPORTANT: LoRA does NOT save activation memory at training time — only
+# optimizer state. With autograd needing activations to backprop to adapter
+# weights, the forward/backward memory profile is the same as full FT.
+# Use the same batch_size/grad_accum as configs/point.yaml so we don't OOM
+# on a 24 GB 4090. Effective batch stays at 32 via grad_accum=4.
+batch_size: 8
+grad_accum: 4
 lr: 2.0e-4                # 10x full-FT lr is standard LoRA practice
 warmup_ratio: 0.10
 weight_decay: 0.0
