@@ -74,19 +74,26 @@ fi
 
 echo
 echo "=== [0b] python deps ==="
-# Pin pip / wheel / setuptools first (older base images ship pip < 23 which
-# can't resolve some recent tree-sitter wheels).
-python -m pip install --quiet --upgrade pip wheel setuptools
+# Pin pip / wheel only. Don't upgrade setuptools — torch 2.10+ caps it at <82,
+# and the base image's setuptools (typically 65–70) already satisfies that.
+# Upgrading to the latest setuptools (82+) silently breaks torch's dep resolver
+# and leaves you with a half-installed environment.
+python -m pip install --quiet --upgrade pip wheel
 
-# CUDA-matched torch from the cu124 index. The 4090 (Ada, sm_89) works on cu121
-# / cu124 / cu126 / cu128 — but Runpod's 4090 templates ship driver 12.4 most
-# reliably, and the cu128 index has started serving +cu130 wheels at HEAD which
-# need driver 12.8+. cu124 is the safest pin: matches driver 12.4 exactly and
-# falls forward to any newer driver.
-# --force-reinstall guards against a previously-broken torch (e.g. +cu130)
-# already installed in the pod from a prior bootstrap attempt.
+# CUDA-matched torch, pinned to a stable 2.4 cu124 build:
+#   - 4090 (Ada, sm_89) works on cu121 / cu124 / cu126; we use cu124 because
+#     Runpod's 4090 templates ship driver 12.4 most reliably.
+#   - PyTorch's cu128 index has started serving +cu130 wheels which need
+#     driver 12.8+; we avoid that index entirely.
+#   - PyTorch's cu124 index ALSO publishes 2.11.x at HEAD, and 2.11+ adds a
+#     setuptools<82 cap that fights modern pip envs. We pin torch==2.4.1 to
+#     stay clear of both issues — known-stable, doesn't pin setuptools, and
+#     supports every transformers/peft feature this repo uses.
+#   - --force-reinstall guards against a previously-broken torch (e.g. 2.11+cu130)
+#     already installed in the pod from a prior bootstrap attempt.
 python -m pip install --quiet --force-reinstall \
-    --index-url https://download.pytorch.org/whl/cu124 torch
+    --index-url https://download.pytorch.org/whl/cu124 \
+    "torch==2.4.1"
 
 # Strip torchvision/torchaudio if the base image bundled them — they almost
 # certainly won't match the cu124 torch we just installed and will explode on

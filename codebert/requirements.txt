@@ -1,16 +1,23 @@
 # Core ML stack — tested on RTX 4090 (Ada, sm_89) Runpod.
 #
-# IMPORTANT: install torch from the cu124 index, NOT cu128.  PyTorch's cu128
-# index has started shipping +cu130 wheels at the latest version, which need
-# NVIDIA driver 12.8+; many current Runpod 4090 templates only ship driver
-# 12.4. cu124 wheels work on driver 12.4+ which covers all current templates.
+# IMPORTANT: do NOT pip-install `torch` from this requirements file directly.
+# Use scripts/run_runpod.sh which pins torch==2.4.1 from the cu124 index:
 #
-#   pip install --force-reinstall --index-url https://download.pytorch.org/whl/cu124 torch
+#   pip install --force-reinstall --index-url https://download.pytorch.org/whl/cu124 torch==2.4.1
+#
+# Why pinned:
+#   - PyPI default index serves a CPU-only torch which won't see your GPU.
+#   - PyTorch's cu128 index has started shipping +cu130 wheels (need driver 12.8+).
+#   - PyTorch's cu124 index ships 2.11+ at HEAD, which caps setuptools<82 and
+#     fights modern pip envs. 2.4.1 stays clear of both.
 #
 # If the base image ships torchvision/torchaudio, uninstall them to avoid
 # transformers' lazy-vision import exploding:
 #   pip uninstall -y torchvision torchaudio
-torch>=2.7.0
+#
+# We don't list torch here because pip-resolving against the default PyPI
+# index would silently grab the CPU build. The bootstrap script does it.
+# torch==2.4.1   # installed by scripts/run_runpod.sh, not from this file
 transformers>=4.45.0,<5.0.0
 peft>=0.13.0
 accelerate>=1.0.0
