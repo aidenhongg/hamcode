@@ -80,25 +80,44 @@ echo "=== [0b] python deps ==="
 # and leaves you with a half-installed environment.
 python -m pip install --quiet --upgrade pip wheel
 
-# CUDA-matched torch, pinned to a stable 2.4 cu124 build:
-#   - 4090 (Ada, sm_89) works on cu121 / cu124 / cu126; we use cu124 because
-#     Runpod's 4090 templates ship driver 12.4 most reliably.
-#   - PyTorch's cu128 index has started serving +cu130 wheels which need
-#     driver 12.8+; we avoid that index entirely.
-#   - PyTorch's cu124 index ALSO publishes 2.11.x at HEAD, and 2.11+ adds a
-#     setuptools<82 cap that fights modern pip envs. We pin torch==2.4.1 to
-#     stay clear of both issues — known-stable, doesn't pin setuptools, and
-#     supports every transformers/peft feature this repo uses.
-#   - --force-reinstall guards against a previously-broken torch (e.g. 2.11+cu130)
-#     already installed in the pod from a prior bootstrap attempt.
+# CUDA-matched torch, pinned to torch==2.6.0+cu124. This is the unique sweet
+# spot satisfying every constraint in this stack:
+#
+#   1. Driver compat: cu124 wheel runs on driver >= 12.4 (Runpod 4090 default).
+#      cu128 wheels are off the table — that index serves +cu130 builds at HEAD
+#      which need driver 12.8+.
+#
+#   2. transformers >= 4.51 (Apr 2025) added check_torch_load_is_safe() in
+#      response to CVE-2025-32434. It refuses to load pytorch_model.bin under
+#      torch < 2.6 even with weights_only=True. microsoft/longcoder-base is
+#      shipped as .bin (no safetensors mirror on HF), so we MUST be on >= 2.6.
+#
+#   3. setuptools compat: torch 2.10+ caps setuptools<82 which fights modern
+#      pip envs. 2.6.0 predates the cap.
+#
+#   4. NCCL ABI: torch 2.7 upgraded its bundled NCCL to 2.21+, which calls
+#      ncclCommWindowDeregister. If a CUDA base image ships an older system
+#      libnccl that gets shadow-loaded ahead of torch's bundled one, that
+#      symbol is missing at import time. torch 2.6.0 bundles NCCL 2.20.x and
+#      doesn't reference the new symbols.
+#
+# --force-reinstall guards against any previously-broken torch from prior
+# bootstrap attempts (e.g. 2.11+cu130 or 2.4.1).
 python -m pip install --quiet --force-reinstall \
     --index-url https://download.pytorch.org/whl/cu124 \
-    "torch==2.4.1"
+    "torch==2.6.0"
 
 # Strip torchvision/torchaudio if the base image bundled them — they almost
 # certainly won't match the cu124 torch we just installed and will explode on
 # transformers' lazy-vision import.
 python -m pip uninstall --quiet -y torchvision torchaudio || true
+
+# Belt-and-braces: ensure torch's bundled libnccl/libcudart are preferred
+# over any system libs the CUDA base image leaves on the loader path. This
+# only matters if a future torch bump drags NCCL forward; harmless on 2.6.0.
+TORCH_LIB="$(python -c 'import torch, os; print(os.path.dirname(torch.__file__) + "/lib")')"
+export LD_LIBRARY_PATH="${TORCH_LIB}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+echo "  LD_LIBRARY_PATH prepended with: ${TORCH_LIB}"
 
 # Repo deps (peft, tree-sitter, transformers, datasets, etc.)
 python -m pip install --quiet -r requirements.txt
