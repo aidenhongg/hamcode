@@ -33,6 +33,19 @@ STAGE=${STAGE:-all}
 
 LANGUAGES=${LANGUAGES:-"python java cpp c csharp go javascript typescript php ruby rust swift"}
 
+# Phase-C extraction mode for stacker features:
+#   leaky  (default) — extract_lora_features.py: one pass per language using the
+#                      full Phase-B LoRA. Train logits are over-confident
+#                      because the LoRA was trained on those rows. Cheap (~10
+#                      min total). Stacker train metrics will be inflated.
+#   oof              — oof_lora.py: K-fold per language. Trains K LoRAs per
+#                      language to produce out-of-fold train logits with no
+#                      train-set leakage. Expensive (~30 h on 4090 at K=5,
+#                      ~18 h at K=3). Recommended only when binary-head
+#                      generalization is the deliverable.
+EXTRACT_MODE=${EXTRACT_MODE:-leaky}
+OOF_FOLDS=${OOF_FOLDS:-5}
+
 TS=$(date +%Y%m%d-%H%M%S)
 FULLFT_DIR=${FULLFT_DIR:-${RUN_ROOT}/multi-fullft-${TS}}
 LORA_DIR=${LORA_DIR:-${RUN_ROOT}/lora-${TS}}
@@ -317,17 +330,37 @@ if stage_at_or_after extract; then
         --in_splits "${DATA_DIR}/processed" \
         --out_dir "${HEAD_EXTRACTION}"
 
-    echo "=== [5b] LoRA pointwise feature extraction ==="
+    echo "=== [5b] LoRA pointwise feature extraction (mode=${EXTRACT_MODE}) ==="
     require_file "${FULLFT_DIR}/best/codebert_meta.json" "Phase A best/ checkpoint" \
         "set FULLFT_DIR=runs/multi-fullft-<ts> or STAGE=fullft"
     require_file "${LORA_DIR}/python" "Phase B LoRA bundle" \
         "set LORA_DIR=runs/lora-<ts> or STAGE=lora"
-    python -m stacking.features.extract_lora_features \
-        --base_run "${FULLFT_DIR}/best" \
-        --lora_root "${LORA_DIR}" \
-        --in_splits "${DATA_DIR}/processed" \
-        --out_dir "${HEAD_EXTRACTION}" \
-        --batch 8
+    case "${EXTRACT_MODE}" in
+        leaky)
+            python -m stacking.features.extract_lora_features \
+                --base_run "${FULLFT_DIR}/best" \
+                --lora_root "${LORA_DIR}" \
+                --in_splits "${DATA_DIR}/processed" \
+                --out_dir "${HEAD_EXTRACTION}" \
+                --batch 8
+            ;;
+        oof)
+            echo "[runpod] OOF mode: K=${OOF_FOLDS} folds per language."
+            echo "[runpod] Expect ~$((OOF_FOLDS * 6)) h total on a 4090."
+            python -m stacking.features.oof_lora \
+                --base_run "${FULLFT_DIR}/best" \
+                --full_lora_root "${LORA_DIR}" \
+                --in_splits "${DATA_DIR}/processed" \
+                --out_dir "${HEAD_EXTRACTION}" \
+                --n_folds "${OOF_FOLDS}" \
+                --batch 8 \
+                --resume
+            ;;
+        *)
+            echo "[runpod] FATAL: EXTRACT_MODE='${EXTRACT_MODE}' (expected 'leaky' or 'oof')"
+            exit 2
+            ;;
+    esac
 fi
 
 # ---------------------------------------------------------------- Phase 6: head
