@@ -57,6 +57,21 @@ stage_at_or_after() {
     if [[ ${stage_idx} -le ${target_idx} ]]; then return 0; else return 1; fi
 }
 
+# Fail fast with a clear next-step suggestion when a stage is asked to run
+# but its prereqs aren't on disk. Better than letting train.py blow up
+# 200 lines deep in pyarrow.
+require_file() {
+    local path=$1
+    local what=$2
+    local fix=$3
+    if [[ ! -e "${path}" ]]; then
+        echo "[runpod] FATAL: missing prereq for STAGE=${STAGE}"
+        echo "[runpod]   expected: ${path}  (${what})"
+        echo "[runpod]   fix: ${fix}"
+        exit 2
+    fi
+}
+
 # ---------------------------------------------------------------- Phase 0: deps
 # Runs unconditionally regardless of STAGE — fresh Runpod pods don't have these,
 # and even on resumed pods this is idempotent (pip and apt skip what's installed).
@@ -250,6 +265,12 @@ fi
 if stage_at_or_after fullft; then
     echo
     echo "=== [3] Phase A: full FT LongCoder on combined dataset ==="
+    require_file "${DATA_DIR}/processed/train.parquet" "Phase 1+2 output" \
+        "drop the STAGE flag (\`bash $0\`) to run fetch+parse first, or run STAGE=parse"
+    require_file "${DATA_DIR}/processed/val.parquet"   "Phase 1+2 output" \
+        "drop the STAGE flag (\`bash $0\`) to run fetch+parse first, or run STAGE=parse"
+    require_file "${DATA_DIR}/processed/test.parquet"  "Phase 1+2 output" \
+        "drop the STAGE flag (\`bash $0\`) to run fetch+parse first, or run STAGE=parse"
     mkdir -p "${FULLFT_DIR}"
     python -u train.py \
         --data_dir "${DATA_DIR}/processed" \
@@ -262,10 +283,10 @@ fi
 if stage_at_or_after lora; then
     echo
     echo "=== [4] Phase B: per-language LoRA (11 + python) ==="
-    if [[ ! -d "${FULLFT_DIR}/best" ]]; then
-        echo "[runpod] FATAL: ${FULLFT_DIR}/best not found. Set FULLFT_DIR or run STAGE=fullft."
-        exit 2
-    fi
+    require_file "${FULLFT_DIR}/best/codebert_meta.json" "Phase A best/ checkpoint" \
+        "set FULLFT_DIR=runs/multi-fullft-<ts> to point at an existing run, or STAGE=fullft to train Phase A"
+    require_file "${DATA_DIR}/processed/train.parquet" "Phase 1+2 output" \
+        "drop the STAGE flag to run fetch+parse, or STAGE=parse"
     mkdir -p "${LORA_DIR}"
     for lang in ${LANGUAGES}; do
         echo "[runpod]   --- LoRA[${lang}] ---"
@@ -290,11 +311,17 @@ fi
 if stage_at_or_after extract; then
     echo
     echo "=== [5a] AST features (multi-language) ==="
+    require_file "${DATA_DIR}/processed/train.parquet" "Phase 1+2 output" \
+        "drop the STAGE flag to run fetch+parse, or STAGE=parse"
     python -m stacking.features.ast_features \
         --in_splits "${DATA_DIR}/processed" \
         --out_dir "${HEAD_EXTRACTION}"
 
     echo "=== [5b] LoRA pointwise feature extraction ==="
+    require_file "${FULLFT_DIR}/best/codebert_meta.json" "Phase A best/ checkpoint" \
+        "set FULLFT_DIR=runs/multi-fullft-<ts> or STAGE=fullft"
+    require_file "${LORA_DIR}/python" "Phase B LoRA bundle" \
+        "set LORA_DIR=runs/lora-<ts> or STAGE=lora"
     python -m stacking.features.extract_lora_features \
         --base_run "${FULLFT_DIR}/best" \
         --lora_root "${LORA_DIR}" \
@@ -307,6 +334,10 @@ fi
 if stage_at_or_after head; then
     echo
     echo "=== [6] Phase D: train binary head ==="
+    require_file "${HEAD_EXTRACTION}/point_logits_train.parquet" "Phase C extraction output" \
+        "STAGE=extract first"
+    require_file "${DATA_DIR}/processed/pair_train.parquet" "pairwise parquet" \
+        "drop the STAGE flag to run fetch+parse, or STAGE=parse"
     python -m stacking.train_head \
         --in_dir "${HEAD_EXTRACTION}" \
         --pair_dir "${DATA_DIR}/processed" \
