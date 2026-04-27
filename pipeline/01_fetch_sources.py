@@ -49,19 +49,20 @@ MBXP_FILES: dict[str, tuple[str, ...]] = {
         "https://raw.githubusercontent.com/amazon-science/mxeval/main/data/mbxp/mbtsp_release_v1.2.jsonl",
     ),
     "mbcpp.jsonl": (
-        "https://raw.githubusercontent.com/amazon-science/mxeval/main/data/mbxp/mbcpp_release_v1.jsonl",
+        "https://raw.githubusercontent.com/amazon-science/mxeval/main/data/mbxp/mbcpp_release_v1.2.jsonl",
     ),
     "mbcsp.jsonl": (
-        "https://raw.githubusercontent.com/amazon-science/mxeval/main/data/mbxp/mbcsp_release_v1.jsonl",
+        "https://raw.githubusercontent.com/amazon-science/mxeval/main/data/mbxp/mbcsp_release_v1.2.jsonl",
     ),
     "mbgp.jsonl": (
-        "https://raw.githubusercontent.com/amazon-science/mxeval/main/data/mbxp/mbgp_release_v1.jsonl",
+        # mbgp re-versioned to v1.1 (not v1.2 like its siblings)
+        "https://raw.githubusercontent.com/amazon-science/mxeval/main/data/mbxp/mbgp_release_v1.1.jsonl",
     ),
     "mbphp.jsonl": (
-        "https://raw.githubusercontent.com/amazon-science/mxeval/main/data/mbxp/mbphp_release_v1.jsonl",
+        "https://raw.githubusercontent.com/amazon-science/mxeval/main/data/mbxp/mbphp_release_v1.2.jsonl",
     ),
     "mbrbp.jsonl": (
-        "https://raw.githubusercontent.com/amazon-science/mxeval/main/data/mbxp/mbrbp_release_v1.jsonl",
+        "https://raw.githubusercontent.com/amazon-science/mxeval/main/data/mbxp/mbrbp_release_v1.2.jsonl",
     ),
     "mbswp.jsonl": (
         "https://raw.githubusercontent.com/amazon-science/mxeval/main/data/mbxp/mbswp_release_v1.jsonl",
