@@ -412,6 +412,14 @@ def main() -> int:
     model = build_model(cfg.model_name)
     logger.info("moving model to %s ...", device)
     model = model.to(device)
+    # At seq > 1024 with attention_window matched to seq_len, Longformer falls
+    # back to full O(L^2) attention and activations balloon past 30GB on a
+    # 32GB 5090. Gradient checkpointing recomputes activations on backward,
+    # cutting peak VRAM ~3x at ~30% extra wallclock per step. Cheap insurance.
+    if cfg.max_seq_len > 1024:
+        model.encoder.gradient_checkpointing_enable()
+        logger.info("gradient checkpointing enabled (max_seq_len=%d > 1024)",
+                    cfg.max_seq_len)
     n_params = sum(p.numel() for p in model.parameters())
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     pct = 100.0 * n_trainable / max(1, n_params)

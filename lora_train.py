@@ -392,6 +392,22 @@ def main() -> int:
 
     # Model
     pmodel, head = build_lora_model(cfg, device)
+    # Same OOM constraint as full-FT: at seq > 1024 with full-attention
+    # (attention_window=seq_len) Longformer's activations exceed 30GB on a
+    # 32GB 5090. LoRA does NOT save activation memory at training time, so
+    # the encoder still needs checkpointing despite only the adapters being
+    # trainable. peft preserves gradient_checkpointing on the wrapped
+    # encoder; we just need to enable it.
+    if cfg.max_seq_len > 1024:
+        pmodel.base_model.model.encoder.gradient_checkpointing_enable()
+        # peft turns on gradient_checkpointing_disable for the trainable
+        # adapter params unless we also flag the wrapper itself, otherwise
+        # the encoder's checkpointing won't actually fire because peft
+        # caches `inputs_require_grad`. enable_input_require_grads() fixes it.
+        if hasattr(pmodel, "enable_input_require_grads"):
+            pmodel.enable_input_require_grads()
+        logger.info("gradient checkpointing enabled (max_seq_len=%d > 1024)",
+                    cfg.max_seq_len)
     n_total = sum(p.numel() for p in pmodel.parameters())
     n_train = sum(p.numel() for p in pmodel.parameters() if p.requires_grad)
     logger.info("params total=%s trainable=%s (%.2f%%)",
