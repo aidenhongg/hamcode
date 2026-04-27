@@ -5,7 +5,7 @@ Background
 ``transformers.models.longformer.modeling_longformer.LongformerSelfAttention``
 uses advanced indexing patterns (``aten::index`` / ``index_put``) that fail to
 ONNX-export correctly across all known exporter paths (legacy tracer, dynamo,
-optimum). At ``seq_len <= attention_window`` (our deployment case: 2048 <= 2048)
+optimum). At ``seq_len <= attention_window`` (our deployment case: 1024 <= 1024)
 sliding-window attention degenerates to full attention, so we can replace the
 custom kernel with a vanilla MatMul-based attention layer that uses only
 ONNX-friendly ops (MatMul / Add / Softmax / Where / Reshape / Transpose).
@@ -319,7 +319,7 @@ def _make_synthetic_inputs(seq_len: int, n_globals: int) -> dict[str, torch.Tens
 
 def parity_test(
     backbone_path: Path,
-    seq_len: int = 2048,
+    seq_len: int = 1024,
     n_globals: int = 8,
     atol: float = 1e-4,
 ) -> dict[str, Any]:
@@ -395,7 +395,7 @@ def main() -> int:
         print(f"ERROR: backbone path not found: {backbone_path}", file=sys.stderr)
         return 1
 
-    result = parity_test(backbone_path=backbone_path, seq_len=2048, n_globals=8, atol=1e-4)
+    result = parity_test(backbone_path=backbone_path, seq_len=1024, n_globals=8, atol=1e-4)
 
     print("\n" + "=" * 60)
     print("Phase-1 parity test (original vs patched, PyTorch-vs-PyTorch)")

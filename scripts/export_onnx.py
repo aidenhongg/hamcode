@@ -9,7 +9,7 @@ Produces under <out_dir>/:
                                           via ONNX external_data)
   manifest.json                          (file list, sha256, schema, language map)
 
-Per-language modules encode a single B snippet at max_seq_len=2048 (batch=1)
+Per-language modules encode a single B snippet at max_seq_len=1024 (batch=1)
 and consume A's features as direct inputs (precomputed externally — the
 known-faster reference is fixed per ingest, so re-encoding it on every
 inference would be wasted work). Output is `probabilities[2]` =
@@ -92,7 +92,7 @@ HEAD_SELECTION: list[tuple[str, str, int]] = [
     ("php",        "lgbm", 42),
 ]
 
-MAX_SEQ_LEN = 2048
+MAX_SEQ_LEN = 1024
 HIDDEN = 768
 N_LABELS = NUM_POINT_LABELS              # 11
 N_AST = len(FEATURE_NAMES) * 4           # 84
@@ -290,8 +290,8 @@ def load_backbone(backbone_dir: Path) -> LongCoderClassifier:
     for p in bb.parameters():
         p.requires_grad_(False)
     # FullAttentionReplacement is only mathematically valid when seq_len <=
-    # attention_window. We deploy at seq=MAX_SEQ_LEN (2048) and the model is
-    # built with attention_window=2048 (see model.py). Assert defensively.
+    # attention_window. We deploy at seq=MAX_SEQ_LEN (1024) and the model is
+    # built with attention_window=1024 (see model.py). Assert defensively.
     aw = bb.encoder.config.attention_window
     if isinstance(aw, list):
         aw_min = min(aw)

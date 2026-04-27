@@ -182,6 +182,54 @@ def _join_point_logits(
     return X, cols, scaled
 
 
+def _join_token_counts(
+    pair_tbl,
+    tok_count_tbl,
+    norm_divisor: float = 1024.0,
+) -> tuple[np.ndarray, list[str]]:
+    """Build the token-count block (2 cols: A and B normalized).
+
+    Each side's token count is looked up by code sha and divided by
+    `norm_divisor` (the deployment max_seq_len). Snippets whose tokenized
+    length exceeds the window produce values > 1.0; that's intentional
+    signal for the head, not a clipping bug.
+
+    Returns (X, columns). The caller marks these scaled_flags=False so
+    the StandardScaler preserves the /1024 unit.
+    """
+    import hashlib
+
+    code_a = pair_tbl.column("code_a").to_pylist()
+    code_b = pair_tbl.column("code_b").to_pylist()
+    n = len(code_a)
+
+    sha_to_count: dict[str, int] = {}
+    shas = tok_count_tbl.column("code_sha256").to_pylist()
+    counts = tok_count_tbl.column("token_count").to_pylist()
+    for s, c in zip(shas, counts):
+        sha_to_count[s] = int(c)
+
+    a_norm = np.zeros(n, dtype=np.float32)
+    b_norm = np.zeros(n, dtype=np.float32)
+    missing = 0
+    for i, (ca, cb) in enumerate(zip(code_a, code_b)):
+        sa = hashlib.sha256(ca.encode("utf-8")).hexdigest()
+        sb = hashlib.sha256(cb.encode("utf-8")).hexdigest()
+        ca_count = sha_to_count.get(sa)
+        cb_count = sha_to_count.get(sb)
+        if ca_count is None or cb_count is None:
+            missing += 1
+            continue
+        a_norm[i] = ca_count / norm_divisor
+        b_norm[i] = cb_count / norm_divisor
+    if missing:
+        print(f"[dataset] token_count: {missing}/{n} pair sides unmapped, zero-filled",
+              flush=True)
+
+    X = np.stack([a_norm, b_norm], axis=1)
+    return X, ["point_A_token_count_norm", "point_B_token_count_norm"]
+
+
 def _join_similarity(pair_ids: list[str], sim_tbl) -> tuple[np.ndarray, list[str]]:
     cols = ["cls_cosine", "cls_l2", "cls_mean_abs_diff", "cls_max_abs_diff"]
     available = [c for c in cols if c in sim_tbl.schema.names]
@@ -213,8 +261,14 @@ def build_feature_matrix(
     extraction_dir: Path,
     include_ast: bool = True,
     include_sim: bool = True,
+    include_token_count: bool = False,
 ) -> FeatureMatrix:
-    """Assemble features for one split. Filters B>=A and builds y."""
+    """Assemble features for one split. Filters B>=A and builds y.
+
+    `include_token_count` toggles the per-snippet normalized BPE token-count
+    feature (2 cols: A and B, each divided by 1024). Off by default so the
+    schema matches legacy heads; sweep flips it on per feature_set.
+    """
     pair_pq = in_splits / f"pair_{split}.parquet"
     point_pq = in_splits / f"{split}.parquet"
 
@@ -266,6 +320,21 @@ def build_feature_matrix(
         blocks.append(mat)
         col_names.extend(cols)
         scaled_flags.extend(sflags)
+
+    # Token count (normalized by max_seq_len=1024)
+    if include_token_count:
+        tok_pq = extraction_dir / f"point_token_count_{split}.parquet"
+        tok_tbl = _load_or_empty(tok_pq, "point_token_count")
+        if tok_tbl is None:
+            raise RuntimeError(
+                f"include_token_count=True but {tok_pq} is missing; run "
+                f"`python -m stacking.features.token_count` first."
+            )
+        mat, cols = _join_token_counts(pair_tbl, tok_tbl, norm_divisor=1024.0)
+        blocks.append(mat)
+        col_names.extend(cols)
+        # /1024 normalization is the final form — bypass the StandardScaler.
+        scaled_flags.extend([False] * len(cols))
 
     # Similarity
     if include_sim:
@@ -345,14 +414,18 @@ def build_all_splits(
     in_splits: Path,
     extraction_dir: Path,
     out_dir: Path | None = None,
+    include_token_count: bool = False,
 ) -> tuple[FeatureMatrix, FeatureMatrix, FeatureMatrix]:
     """Build train/val/test, fit scaler on train, apply to val+test.
 
     If out_dir is given, save scaler + schema to disk.
     """
-    train = build_feature_matrix("train", in_splits, extraction_dir)
-    val = build_feature_matrix("val", in_splits, extraction_dir)
-    test = build_feature_matrix("test", in_splits, extraction_dir)
+    train = build_feature_matrix("train", in_splits, extraction_dir,
+                                 include_token_count=include_token_count)
+    val = build_feature_matrix("val", in_splits, extraction_dir,
+                               include_token_count=include_token_count)
+    test = build_feature_matrix("test", in_splits, extraction_dir,
+                                include_token_count=include_token_count)
 
     # All three must have identical column schema
     assert train.columns == val.columns == test.columns, (
@@ -457,6 +530,7 @@ def build_per_language_splits(
     languages: list[str] | None = None,
     min_val_rows: int = MIN_VAL_ROWS,
     carveout_fraction: float = CARVEOUT_FRACTION,
+    include_token_count: bool = False,
 ) -> dict[str, tuple[FeatureMatrix, FeatureMatrix, FeatureMatrix]]:
     """Build per-language (train, val, test) FeatureMatrix triples.
 
@@ -476,6 +550,7 @@ def build_per_language_splits(
     train_g, val_g, test_g = build_all_splits(
         in_splits=in_splits,
         extraction_dir=extraction_dir, out_dir=out_dir,
+        include_token_count=include_token_count,
     )
 
     if languages is None:

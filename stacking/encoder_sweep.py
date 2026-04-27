@@ -170,6 +170,17 @@ def _run_recipe(
     ]
     _run(sem_cmd)
 
+    # Per-snippet BPE token count for the with_token_count feature_set in
+    # the head sweep. Cheap CPU-only step (~tens of seconds for ~5k rows);
+    # reads from data_dir, writes point_token_count_<split>.parquet into
+    # recipe_extraction so the head sweep can join by sha.
+    tok_cmd = [
+        sys.executable, "-m", "stacking.features.token_count",
+        "--in_splits", str(data_dir),
+        "--out_dir", str(recipe_extraction),
+    ]
+    _run(tok_cmd)
+
     sweep_cmd = [
         sys.executable, "-m", "stacking.sweep",
         "--config", str(head_sweep_config),

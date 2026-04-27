@@ -139,15 +139,15 @@ def test_t8_configs_parse() -> None:
     pcfg = yaml.safe_load((REPO / "configs/point.yaml").read_text())
     lcfg = yaml.safe_load((REPO / "configs/lora.yaml").read_text())
     assert pcfg["model_name"] == "microsoft/longcoder-base"
-    assert pcfg["max_seq_len"] == 2048
-    assert pcfg["batch_size"] == 4
-    assert pcfg["grad_accum"] == 8
+    assert pcfg["max_seq_len"] == 1024
+    assert pcfg["batch_size"] == 8
+    assert pcfg["grad_accum"] == 4
     assert pcfg["balanced_sampler"] is True
     assert lcfg["r"] == 16
     assert lcfg["lora_alpha"] == 32
-    assert lcfg["max_seq_len"] == 2048
-    assert lcfg["batch_size"] == 4
-    assert lcfg["grad_accum"] == 8
+    assert lcfg["max_seq_len"] == 1024
+    assert lcfg["batch_size"] == 8
+    assert lcfg["grad_accum"] == 4
     assert "query_global" in lcfg["target_modules"]
 
 

@@ -1,14 +1,14 @@
 model_name: microsoft/longcoder-base
 
 # Sequence
-max_seq_len: 2048
+max_seq_len: 1024
 bridge_stride: 128
 
-# Optimization (full FT, 32 GB RTX 5090 at seq 2048, bf16)
-# attention_window is bumped to 2048 in model.py so seq <= window everywhere,
+# Optimization (full FT, 32 GB RTX 5090 at seq 1024, bf16)
+# attention_window matches the pretrained default 1024 so seq <= window everywhere,
 # keeping the ONNX FullAttentionReplacement valid at the same seq_len.
-batch_size: 4
-grad_accum: 8
+batch_size: 8
+grad_accum: 4
 lr: 2.0e-5
 warmup_ratio: 0.10        # was 0.15; with ~50-70k records the ramp is shorter relative to total steps
 weight_decay: 0.01

@@ -153,7 +153,7 @@ def main() -> int:
     ap.add_argument("--base_run", help="Required with --bundle: Phase-A best/ dir")
     ap.add_argument("--language", default=None,
                     help="Language id; required for --stdin, optional otherwise")
-    ap.add_argument("--max_seq_len", type=int, default=2048)
+    ap.add_argument("--max_seq_len", type=int, default=1024)
     ap.add_argument("--bridge_stride", type=int, default=128)
     g_in = ap.add_mutually_exclusive_group(required=True)
     g_in.add_argument("--input", help="Path to a code file")

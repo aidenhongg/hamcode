@@ -103,6 +103,7 @@ def run(
     class_weight_mode: str = "auto",
     head_hp: dict | None = None,
     language: str | None = None,
+    include_token_count: bool = False,
 ) -> dict:
     """Train one head.
 
@@ -111,6 +112,9 @@ def run(
     by the per-language sweep. The scaler is still fit on the full
     language-mixed train, so feature distributions stay calibrated; the
     head sees only its language's rows.
+
+    `include_token_count` toggles the normalized BPE token-count feature
+    block (2 cols, A and B, /1024). Driven by the sweep's feature_sets axis.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -119,12 +123,14 @@ def run(
         train, val, test = ds.build_all_splits(
             in_splits=in_splits,
             extraction_dir=extraction_dir, out_dir=out_dir,
+            include_token_count=include_token_count,
         )
     else:
         per_lang = ds.build_per_language_splits(
             in_splits=in_splits,
             extraction_dir=extraction_dir, out_dir=out_dir,
             languages=[language],
+            include_token_count=include_token_count,
         )
         if language not in per_lang:
             raise RuntimeError(
@@ -172,6 +178,7 @@ def run(
         "head": head_name,
         "seed": seed,
         "language": language,
+        "include_token_count": include_token_count,
         "class_weight_mode": class_weight_mode,
         "class_weight": cw,
         "hp": head.hp,

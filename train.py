@@ -87,10 +87,10 @@ class Config:
     train_parquet: str = ""
     val_parquet: str = ""
     test_parquet: str = ""
-    max_seq_len: int = 2048
+    max_seq_len: int = 1024
     bridge_stride: int = 128
-    batch_size: int = 4
-    grad_accum: int = 8
+    batch_size: int = 8
+    grad_accum: int = 4
     lr: float = 2e-5
     warmup_ratio: float = 0.15
     weight_decay: float = 0.01
@@ -412,14 +412,6 @@ def main() -> int:
     model = build_model(cfg.model_name)
     logger.info("moving model to %s ...", device)
     model = model.to(device)
-    # At seq > 1024 with attention_window matched to seq_len, Longformer falls
-    # back to full O(L^2) attention and activations balloon past 30GB on a
-    # 32GB 5090. Gradient checkpointing recomputes activations on backward,
-    # cutting peak VRAM ~3x at ~30% extra wallclock per step. Cheap insurance.
-    if cfg.max_seq_len > 1024:
-        model.encoder.gradient_checkpointing_enable()
-        logger.info("gradient checkpointing enabled (max_seq_len=%d > 1024)",
-                    cfg.max_seq_len)
     n_params = sum(p.numel() for p in model.parameters())
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     pct = 100.0 * n_trainable / max(1, n_params)

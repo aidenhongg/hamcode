@@ -198,7 +198,7 @@ def main() -> int:
                         help="raw code strings (escape newlines)")
     ap.add_argument("--fp16", action="store_true", default=True)
     ap.add_argument("--no_fp16", dest="fp16", action="store_false")
-    ap.add_argument("--max_seq_len", type=int, default=2048)
+    ap.add_argument("--max_seq_len", type=int, default=1024)
     args = ap.parse_args()
 
     if args.head_root:

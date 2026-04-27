@@ -80,7 +80,7 @@ def _memory_token_id(tokenizer) -> int:
 def build_point_inputs(
     code: str,
     tokenizer,
-    max_seq_len: int = 2048,
+    max_seq_len: int = 1024,
     bridge_stride: int = 128,
     language: str = "python",
 ) -> InputBundle:
@@ -217,7 +217,7 @@ class PointDataset(Dataset):
         self,
         parquet_path: str | Path,
         tokenizer,
-        max_seq_len: int = 2048,
+        max_seq_len: int = 1024,
         bridge_stride: int = 128,
         cache_dir: str | None = None,
         language_filter: str | None = None,

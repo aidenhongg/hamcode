@@ -8,13 +8,11 @@ bidirectional classification by:
     has effectively no learned representation under the pretraining objective,
     while the last position carries the prefix's compressed summary.
 
-attention_window: bumped from the pretrained default 1024 to 2048 so it
-matches our training/deployment seq_len. With seq_len <= attention_window
-the sliding-window kernel degenerates to full attention, which keeps the
-ONNX FullAttentionReplacement (scripts/longcoder_onnx_attention.py)
-mathematically valid. Pretrained weights still load — the window is a
-runtime config, not a weight shape — so this is a forward-pass behavior
-change, not a weight-init change.
+attention_window: matches the pretrained default 1024 and our training/
+deployment seq_len. With seq_len <= attention_window the sliding-window
+kernel degenerates to full attention, which keeps the ONNX
+FullAttentionReplacement (scripts/longcoder_onnx_attention.py)
+mathematically valid.
 
 The classifier head is a single linear over `hidden_size`. Bridge + memory
 token construction lives in data.py - the model itself just consumes the
@@ -34,7 +32,7 @@ from transformers import LongformerModel
 from common.labels import NUM_POINT_LABELS
 
 
-DEFAULT_ATTENTION_WINDOW = 2048
+DEFAULT_ATTENTION_WINDOW = 1024
 
 
 class LongCoderClassifier(nn.Module):
@@ -49,8 +47,8 @@ class LongCoderClassifier(nn.Module):
         self.num_labels = NUM_POINT_LABELS
         self.model_name = model_name
         self.attention_window = attention_window
-        # Override pretrained attention_window so seq <= window everywhere
-        # we run (training at 2048; ONNX deploy at 2048).
+        # Pin attention_window so seq <= window everywhere we run
+        # (training at 1024; ONNX deploy at 1024).
         self.encoder = LongformerModel.from_pretrained(
             model_name, attention_window=attention_window,
         )
@@ -101,9 +99,8 @@ class LongCoderClassifier(nn.Module):
     def load_checkpoint(cls, path: str | Path, **_: Any) -> "LongCoderClassifier":
         p = Path(path)
         meta = json.loads((p / "codebert_meta.json").read_text(encoding="utf-8"))
-        # Older meta files (pre-attention_window-bump) don't carry the field;
-        # fall back to the new default. Such checkpoints predate the seq=2048
-        # change and need to be retrained anyway.
+        # Older meta files don't always carry attention_window; fall back to
+        # the current default (1024 == pretrained == our seq_len).
         attention_window = int(meta.get("attention_window", DEFAULT_ATTENTION_WINDOW))
         model = cls(model_name=meta["model_name"], attention_window=attention_window)
         state = torch.load(p / "pytorch_model.bin", map_location="cpu")

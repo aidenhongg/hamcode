@@ -1,5 +1,5 @@
 # Default sweep config: per-language head selection.
-# 4 heads x 3 seeds x N languages (auto-detected from train.parquet).
+# 4 heads x 3 seeds x N languages x 2 feature_sets (auto-detected from train.parquet).
 heads: [xgb, lgbm, mlp, stacked]
 seeds: [42, 43, 44]
 class_weight: auto
@@ -7,3 +7,10 @@ class_weight: auto
 # (currently 12). Replace with an explicit list to subset, e.g.:
 #   languages: [python, java, cpp]
 languages: auto
+# feature_sets axis: each name maps to an include_token_count bool. Adding
+# entries here multiplies the sweep size; "default" matches the legacy
+# pre-token-count schema and "with_token_count" appends the 2-col normalized
+# BPE token-count block (point_A_token_count_norm, point_B_token_count_norm).
+feature_sets:
+  default: false
+  with_token_count: true

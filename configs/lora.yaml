@@ -7,17 +7,15 @@ lora_dropout: 0.1
 target_modules: [query, key, value, query_global, key_global, value_global]
 
 # Training
-max_seq_len: 2048
+max_seq_len: 1024
 bridge_stride: 128
 # IMPORTANT: LoRA does NOT save activation memory at training time — only
 # optimizer state. With autograd needing activations to backprop to adapter
 # weights, the forward/backward memory profile is the same as full FT.
-# At seq 2048 batch 4 (effective 32 via grad_accum=8) on a 32 GB RTX 5090,
-# expect ~22-26 GB live VRAM. If LoRA OOMs in practice, drop batch_size to 2
-# and bump grad_accum to 16, or call model.encoder.gradient_checkpointing_enable()
-# manually before training.
-batch_size: 4
-grad_accum: 8
+# At seq 1024 batch 8 (effective 32 via grad_accum=4) on a 32 GB RTX 5090,
+# expect ~10-14 GB live VRAM. Comfortable headroom; no checkpointing needed.
+batch_size: 8
+grad_accum: 4
 lr: 2.0e-4                # 10x full-FT lr is standard LoRA practice
 warmup_ratio: 0.10
 weight_decay: 0.0

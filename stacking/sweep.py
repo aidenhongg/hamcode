@@ -58,15 +58,24 @@ class SweepConfig:
     class_weight: str = "auto"
     languages: list[str] | str = "auto"   # "auto" -> detect from train
     universal: bool = False
+    # Maps feature_set name -> include_token_count bool. Default is the
+    # legacy single-set behavior so existing runs keep working.
+    feature_sets: dict[str, bool] = field(
+        default_factory=lambda: {"default": False}
+    )
 
     @classmethod
     def load(cls, path: Path) -> "SweepConfig":
         cfg = yaml.safe_load(path.read_text(encoding="utf-8"))
+        feature_sets = cfg.get("feature_sets") or {"default": False}
+        # Coerce values to bool — yaml may surface "true"/"false" as strings.
+        feature_sets = {str(k): bool(v) for k, v in feature_sets.items()}
         return cls(
             heads=list(cfg["heads"]),
             seeds=list(cfg["seeds"]),
             class_weight=cfg.get("class_weight", "auto"),
             languages=cfg.get("languages", "auto"),
+            feature_sets=feature_sets,
         )
 
 
@@ -90,21 +99,25 @@ def _resolve_languages(
 
 def _run_one(head: str, seed: int, in_splits: Path,
              extraction_dir: Path, out_dir: Path, class_weight: str,
-             failures: Path, language: str | None) -> dict | None:
+             failures: Path, language: str | None,
+             feature_set: str, include_token_count: bool) -> dict | None:
+    leaf = f"{head}-s{seed}-fs_{feature_set}"
     if language is None:
-        exp_dir = out_dir / f"{head}-s{seed}"
+        exp_dir = out_dir / leaf
     else:
-        exp_dir = out_dir / "per_lang" / language / f"{head}-s{seed}"
+        exp_dir = out_dir / "per_lang" / language / leaf
     try:
         met = th.run(
             head_name=head, seed=seed,
             in_splits=in_splits, extraction_dir=extraction_dir,
             out_dir=exp_dir, class_weight_mode=class_weight,
             language=language,
+            include_token_count=include_token_count,
         )
         row = {
             "head": head, "seed": seed,
             "language": language if language is not None else "_universal_",
+            "feature_set": feature_set,
             "test_acc": met["accuracy"],
             "balanced_acc": met["balanced_accuracy"],
             "macro_f1": met["macro_f1"],
@@ -122,13 +135,15 @@ def _run_one(head: str, seed: int, in_splits: Path,
         msg = {
             "head": head, "seed": seed,
             "language": language if language is not None else "_universal_",
+            "feature_set": feature_set,
             "error": str(e),
             "traceback": traceback.format_exc(),
         }
         with failures.open("a", encoding="utf-8") as f:
             f.write(json.dumps(msg) + "\n")
         lang_tag = f" lang={language}" if language is not None else ""
-        print(f"[sweep] FAIL {head}/s{seed}{lang_tag}: {e}", flush=True)
+        print(f"[sweep] FAIL {head}/s{seed}{lang_tag} fs={feature_set}: {e}",
+              flush=True)
         return None
 
 
@@ -157,7 +172,7 @@ def _write_summary(rows: list[dict], out_dir: Path,
         if not rows_sorted:
             f.write("(no successful runs)\n"); return
 
-        cols = ["head", "seed", "language",
+        cols = ["head", "seed", "language", "feature_set",
                 "test_acc", "macro_f1", "roc_auc", "brier", "ece"]
         f.write("| " + " | ".join(cols) + " |\n")
         f.write("|" + "|".join("---" for _ in cols) + "|\n")
@@ -232,6 +247,7 @@ def _write_per_language_summary(rows: list[dict], out_dir: Path) -> None:
         lang: {
             "head": r["head"],
             "seed": r["seed"],
+            "feature_set": r.get("feature_set"),
             "test_acc": r["test_acc"],
             "macro_f1": r["macro_f1"],
             "roc_auc": r.get("roc_auc"),
@@ -249,8 +265,8 @@ def _write_per_language_summary(rows: list[dict], out_dir: Path) -> None:
         if not best_per_lang:
             f.write("(no per-language runs)\n")
             return
-        cols = ["language", "best_head", "best_seed", "n_test",
-                "test_acc", "macro_f1", "roc_auc"]
+        cols = ["language", "best_head", "best_seed", "best_feature_set",
+                "n_test", "test_acc", "macro_f1", "roc_auc"]
         f.write("| " + " | ".join(cols) + " |\n")
         f.write("|" + "|".join("---" for _ in cols) + "|\n")
         # Sort by descending test support so widely-tested languages appear first
@@ -261,6 +277,7 @@ def _write_per_language_summary(rows: list[dict], out_dir: Path) -> None:
                 if isinstance(v, float): return f"{v:.4f}"
                 return str(v)
             f.write(f"| {lang} | {r['head']} | {r['seed']} | "
+                    f"{_fmt(r.get('feature_set'))} | "
                     f"{_fmt(r.get('n_test'))} | {_fmt(r['test_acc'])} | "
                     f"{_fmt(r['macro_f1'])} | {_fmt(r.get('roc_auc'))} |\n")
 
@@ -297,6 +314,8 @@ def main() -> int:
     ap.add_argument("--universal", action="store_true",
                     help="legacy mode: train one head per (head,seed) over ALL "
                          "languages mixed (no per-language axis)")
+    ap.add_argument("--feature_set", default=None,
+                    help="run only this feature_set name (overrides config)")
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -318,6 +337,12 @@ def main() -> int:
         cfg.languages = [args.language]
     if args.universal:
         cfg.universal = True
+    if args.feature_set:
+        if args.feature_set not in cfg.feature_sets:
+            print(f"[sweep] feature_set {args.feature_set!r} not in config "
+                  f"({sorted(cfg.feature_sets)}); aborting", flush=True)
+            return 1
+        cfg.feature_sets = {args.feature_set: cfg.feature_sets[args.feature_set]}
 
     # Resolve languages (or skip the axis entirely in universal mode)
     if cfg.universal:
@@ -333,18 +358,24 @@ def main() -> int:
         languages = list(resolved)
         print(f"[sweep] languages: {languages}", flush=True)
 
-    all_combos = list(itertools.product(cfg.heads, cfg.seeds, languages))
+    feature_set_items = list(cfg.feature_sets.items())
+    all_combos = list(itertools.product(
+        cfg.heads, cfg.seeds, languages, feature_set_items
+    ))
     print(f"[sweep] running {len(all_combos)} experiments "
           f"({len(cfg.heads)} heads x "
-          f"{len(cfg.seeds)} seeds x {len(languages)} languages)", flush=True)
+          f"{len(cfg.seeds)} seeds x {len(languages)} languages x "
+          f"{len(feature_set_items)} feature_sets)", flush=True)
 
     rows: list[dict] = []
-    for head, seed, language in all_combos:
+    for head, seed, language, (fs_name, fs_inc_tok) in all_combos:
         lang_tag = f" / {language}" if language is not None else ""
-        print(f"\n=== {head} / s{seed}{lang_tag} ===", flush=True)
+        print(f"\n=== {head} / s{seed}{lang_tag} / fs={fs_name} ===", flush=True)
         row = _run_one(head, seed,
                         Path(args.in_splits), Path(args.extraction_dir),
-                        out_dir, cfg.class_weight, failures, language)
+                        out_dir, cfg.class_weight, failures, language,
+                        feature_set=fs_name,
+                        include_token_count=fs_inc_tok)
         if row is not None:
             rows.append(row)
             _write_summary(rows, out_dir)
