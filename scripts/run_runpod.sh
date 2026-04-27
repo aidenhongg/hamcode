@@ -138,16 +138,18 @@ python -m pip install --quiet --upgrade --ignore-installed wheel
 #      symbol is missing at import time. torch 2.6.0 bundles NCCL 2.20.x and
 #      doesn't reference the new symbols.
 #
+# Strip torchvision/torchaudio FIRST. The Runpod base image typically ships
+# them at +cu128 pinned to torch==2.8.0, which conflicts with the +cu124 torch
+# we install below. Removing them up front avoids pip's noisy resolver warning
+# during the torch install. We don't use vision/audio anywhere; transformers'
+# lazy-vision import gracefully skips them when absent.
+python -m pip uninstall --quiet -y torchvision torchaudio || true
+
 # --force-reinstall guards against any previously-broken torch from prior
 # bootstrap attempts (e.g. 2.11+cu130 or 2.4.1).
 python -m pip install --quiet --force-reinstall \
     --index-url https://download.pytorch.org/whl/cu124 \
     "torch==2.6.0"
-
-# Strip torchvision/torchaudio if the base image bundled them — they almost
-# certainly won't match the cu124 torch we just installed and will explode on
-# transformers' lazy-vision import.
-python -m pip uninstall --quiet -y torchvision torchaudio || true
 
 # Belt-and-braces: ensure torch's bundled libnccl/libcudart are preferred
 # over any system libs the CUDA base image leaves on the loader path. This
