@@ -117,39 +117,37 @@ echo "=== [0b] python deps ==="
 python -m pip install --quiet --upgrade pip
 python -m pip install --quiet --upgrade --ignore-installed wheel
 
-# CUDA-matched torch, pinned to torch==2.6.0+cu124. This is the unique sweet
-# spot satisfying every constraint in this stack:
+# CUDA-matched torch, pinned to torch==2.7.0+cu128. Constraints:
 #
-#   1. Driver compat: cu124 wheel runs on driver >= 12.4 (Runpod 4090 default).
-#      cu128 wheels are off the table — that index serves +cu130 builds at HEAD
-#      which need driver 12.8+.
+#   1. Hardware: RTX 5090 (Blackwell, sm_120) needs CUDA 12.8+ kernels. The
+#      cu124 wheels we used to pin for the 4090 era have no sm_120 build, so
+#      they load but every kernel launch dies with "no kernel image is
+#      available for execution on the device". cu128 is mandatory on 5090.
 #
-#   2. transformers >= 4.51 (Apr 2025) added check_torch_load_is_safe() in
-#      response to CVE-2025-32434. It refuses to load pytorch_model.bin under
-#      torch < 2.6 even with weights_only=True. microsoft/longcoder-base is
-#      shipped as .bin (no safetensors mirror on HF), so we MUST be on >= 2.6.
+#   2. transformers >= 4.51 added check_torch_load_is_safe() (CVE-2025-32434).
+#      It refuses to load pytorch_model.bin under torch < 2.6 even with
+#      weights_only=True. microsoft/longcoder-base is shipped as .bin only
+#      (no safetensors mirror on HF), so we MUST be on >= 2.6.
 #
 #   3. setuptools compat: torch 2.10+ caps setuptools<82 which fights modern
-#      pip envs. 2.6.0 predates the cap.
+#      pip envs. 2.7.0 predates the cap.
 #
-#   4. NCCL ABI: torch 2.7 upgraded its bundled NCCL to 2.21+, which calls
-#      ncclCommWindowDeregister. If a CUDA base image ships an older system
-#      libnccl that gets shadow-loaded ahead of torch's bundled one, that
-#      symbol is missing at import time. torch 2.6.0 bundles NCCL 2.20.x and
-#      doesn't reference the new symbols.
+#   4. NCCL ABI: torch 2.7+ bundles NCCL 2.21+ which references
+#      ncclCommWindowDeregister. The LD_LIBRARY_PATH prepend below ensures
+#      torch's bundled libnccl loads ahead of any older system one.
 #
 # Strip torchvision/torchaudio FIRST. The Runpod base image typically ships
-# them at +cu128 pinned to torch==2.8.0, which conflicts with the +cu124 torch
-# we install below. Removing them up front avoids pip's noisy resolver warning
-# during the torch install. We don't use vision/audio anywhere; transformers'
-# lazy-vision import gracefully skips them when absent.
+# them at +cu128 pinned to torch==2.8.0; force-reinstalling torch==2.7.0 then
+# leaves the resolver complaining about a version mismatch. Removing them up
+# front silences pip and matches our actual usage (we never import vision or
+# audio).
 python -m pip uninstall --quiet -y torchvision torchaudio || true
 
 # --force-reinstall guards against any previously-broken torch from prior
-# bootstrap attempts (e.g. 2.11+cu130 or 2.4.1).
+# bootstrap attempts (e.g. cu124 builds left over from the 4090-era script).
 python -m pip install --quiet --force-reinstall \
-    --index-url https://download.pytorch.org/whl/cu124 \
-    "torch==2.6.0"
+    --index-url https://download.pytorch.org/whl/cu128 \
+    "torch==2.7.0"
 
 # Belt-and-braces: ensure torch's bundled libnccl/libcudart are preferred
 # over any system libs the CUDA base image leaves on the loader path. This

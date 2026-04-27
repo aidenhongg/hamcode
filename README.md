@@ -36,8 +36,9 @@ Pick base image `nvidia/cuda:12.8.0-cudnn-devel-ubuntu22.04` — Blackwell (sm_1
 
 ```bash
 pip install -r requirements.txt
-# Torch wheels with cu128 come from a non-default index:
-pip install --index-url https://download.pytorch.org/whl/cu128 torch==2.6.0
+# Torch wheels with cu128 come from a non-default index. Blackwell (sm_120)
+# kernels require this wheel; cu124 builds load but can't launch on a 5090.
+pip install --index-url https://download.pytorch.org/whl/cu128 torch==2.7.0
 
 # Build the dataset (clones doocs/leetcode, downloads CodeComplex, generates synthetics)
 ./run_pipeline.sh
