@@ -107,7 +107,15 @@ echo "=== [0b] python deps ==="
 # and the base image's setuptools (typically 65–70) already satisfies that.
 # Upgrading to the latest setuptools (82+) silently breaks torch's dep resolver
 # and leaves you with a half-installed environment.
-python -m pip install --quiet --upgrade pip wheel
+#
+# --ignore-installed on wheel: Runpod base images often have wheel apt-installed
+# (python3-wheel) without pip metadata (no RECORD file). pip's default behavior
+# is to uninstall the existing wheel before installing the upgrade, which fails
+# with "uninstall-no-record-file". Ignoring the existing install lets pip
+# overlay a fresh wheel into a writable site-packages without touching the apt
+# one. Same flag for pip is unnecessary (it's pip-managed) but harmless.
+python -m pip install --quiet --upgrade pip
+python -m pip install --quiet --upgrade --ignore-installed wheel
 
 # CUDA-matched torch, pinned to torch==2.6.0+cu124. This is the unique sweet
 # spot satisfying every constraint in this stack:
