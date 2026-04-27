@@ -1,0 +1,9 @@
+# Default sweep config: per-language head selection.
+# 4 heads x 3 seeds x N languages (auto-detected from train.parquet).
+heads: [xgb, lgbm, mlp, stacked]
+seeds: [42, 43, 44]
+class_weight: auto
+# 'auto' enumerates languages from data/processed/pair_train.parquet
+# (currently 12). Replace with an explicit list to subset, e.g.:
+#   languages: [python, java, cpp]
+languages: auto

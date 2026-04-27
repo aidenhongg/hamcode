@@ -1,0 +1,28 @@
+model_name: microsoft/longcoder-base
+
+# Sequence
+max_seq_len: 2048
+bridge_stride: 128
+
+# Optimization (full FT, 32 GB RTX 5090 at seq 2048, bf16)
+# attention_window is bumped to 2048 in model.py so seq <= window everywhere,
+# keeping the ONNX FullAttentionReplacement valid at the same seq_len.
+batch_size: 4
+grad_accum: 8
+lr: 2.0e-5
+warmup_ratio: 0.10        # was 0.15; with ~50-70k records the ramp is shorter relative to total steps
+weight_decay: 0.01
+epochs: 30                # generous upper bound; patience is the real stopper
+label_smoothing: 0.05     # mild; keeps tail classes from collapsing
+bf16: true
+class_weights: auto       # auto | none | PATH to json of floats (11 values)
+balanced_sampler: true    # WeightedRandomSampler keyed by (language, label)
+
+# Eval / checkpointing
+eval_every_steps: 500
+patience: 4               # stop if val macro-F1 doesn't improve for this many evals in a row
+min_delta: 1.0e-4         # improvements smaller than this don't count
+seed: 42
+
+# Logging
+wandb_project: codebert-complexity

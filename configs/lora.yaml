@@ -1,0 +1,37 @@
+# Per-language LoRA fine-tune on top of the Phase-A universal backbone.
+
+# LoRA config
+r: 16
+lora_alpha: 32
+lora_dropout: 0.1
+target_modules: [query, key, value, query_global, key_global, value_global]
+
+# Training
+max_seq_len: 2048
+bridge_stride: 128
+# IMPORTANT: LoRA does NOT save activation memory at training time — only
+# optimizer state. With autograd needing activations to backprop to adapter
+# weights, the forward/backward memory profile is the same as full FT.
+# At seq 2048 batch 4 (effective 32 via grad_accum=8) on a 32 GB RTX 5090,
+# expect ~22-26 GB live VRAM. If LoRA OOMs in practice, drop batch_size to 2
+# and bump grad_accum to 16, or call model.encoder.gradient_checkpointing_enable()
+# manually before training.
+batch_size: 4
+grad_accum: 8
+lr: 2.0e-4                # 10x full-FT lr is standard LoRA practice
+warmup_ratio: 0.10
+weight_decay: 0.0
+epochs: 20
+patience: 4
+min_delta: 1.0e-4
+label_smoothing: 0.05
+bf16: true
+class_weights: auto
+balanced_sampler: true    # within-(label) inside the language slice
+seed: 42
+
+# Eval cadence
+eval_every_steps: 200
+
+# Logging
+wandb_project: codebert-complexity-lora

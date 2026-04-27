@@ -1,5 +1,0 @@
-# Default sweep config: 4 heads x 1 variant x 3 seeds = 12 experiments.
-heads: [xgb, lgbm, mlp, stacked]
-variants: [v1]
-seeds: [42, 43, 44]
-class_weight: auto
