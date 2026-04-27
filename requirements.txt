@@ -30,6 +30,11 @@ peft>=0.13.0
 accelerate>=1.0.0
 datasets>=2.20.0
 safetensors>=0.4.5
+# Runpod base images set HF_HUB_ENABLE_HF_TRANSFER=1 in the env but don't ship
+# the package. huggingface_hub then errors on the first download. Pinning here
+# makes phase 0b install it before phase 0c's HF cache pre-warm runs. Bonus:
+# multi-stream downloads cut the LongCoder weight pull (~570 MB) by ~3x.
+hf_transfer>=0.1.6
 
 # Tokenization / parsing — per-language tree-sitter packages (Python 3.13 abi3 wheels).
 # We previously used tree_sitter_languages but it doesn't ship 3.13 wheels.
